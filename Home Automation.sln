@@ -11,6 +11,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Zone_control_dining", "Zone
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Zone_control_study", "Zone_control_study\Zone_control_study.vcxproj", "{623CF594-83FC-4D23-BC72-7FDA285E0B85}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Zone_control_GtHall", "Zone_control_GtHall\Zone_control_GtHall.vcxproj", "{ACB499AC-605E-417D-A4BB-9989F3868CA0}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x86 = Debug|x86
@@ -33,6 +35,10 @@ Global
 		{623CF594-83FC-4D23-BC72-7FDA285E0B85}.Debug|x86.Build.0 = Debug|Win32
 		{623CF594-83FC-4D23-BC72-7FDA285E0B85}.Release|x86.ActiveCfg = Release|Win32
 		{623CF594-83FC-4D23-BC72-7FDA285E0B85}.Release|x86.Build.0 = Release|Win32
+		{ACB499AC-605E-417D-A4BB-9989F3868CA0}.Debug|x86.ActiveCfg = Debug|Win32
+		{ACB499AC-605E-417D-A4BB-9989F3868CA0}.Debug|x86.Build.0 = Debug|Win32
+		{ACB499AC-605E-417D-A4BB-9989F3868CA0}.Release|x86.ActiveCfg = Release|Win32
+		{ACB499AC-605E-417D-A4BB-9989F3868CA0}.Release|x86.Build.0 = Release|Win32
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
