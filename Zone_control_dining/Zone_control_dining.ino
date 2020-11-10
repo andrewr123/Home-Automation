@@ -2,6 +2,7 @@
 
 To do:
 - sendlog context/restore
+- check time functions  <<----
 
 Version history
 ---------------
@@ -458,19 +459,21 @@ void checkManifolds() {      // See if manifolds want more heat - tell boiler
   ard.put(basementIP, UdpArdPort, message, 3);
   bufPosn += snprintf(logMsg + bufPosn, UDP_TX_PACKET_MAX_SIZE - bufPosn, diningManifold ? "D" : "d");
   
-  // Kitchen manifold status deduced from temperature
+  // Kitchen manifold status deduced from temperature - insert extra blank to separate from DHW demand flags next
   message[1] = 'K';
   if (tempC[ZONE_KITCHEN] > targetC[ZONE_KITCHEN]) kitchenManifold = OFF;
   if (tempC[ZONE_KITCHEN] < targetC[ZONE_KITCHEN]) kitchenManifold = ON;      // If neither, then remains unchanged
   message[2] = (kitchenManifold && onPeriod[ZONE_KITCHEN]) ? '1' : '0';
   ard.put(basementIP, UdpArdPort, message, 3);
-  bufPosn += snprintf(logMsg + bufPosn, UDP_TX_PACKET_MAX_SIZE - bufPosn, (message[2] == '1') ? "K" : "k");
-
+  bufPosn += snprintf(logMsg + bufPosn, UDP_TX_PACKET_MAX_SIZE - bufPosn, (message[2] == '1') ? "K " : "k ");
+  
+  /* Gt Hall has its own controller - from Nov 20
 	// Great Hall no sensors, just determine by timePeriod pending its own controller. 
 	message[1] = 'G';
 	message[2] = (onPeriod[GREAT_HALL_MANIFOLD]) ? '1' : '0';
 	ard.put(basementIP, UdpArdPort, message, 3);
 	bufPosn += snprintf(logMsg + bufPosn, UDP_TX_PACKET_MAX_SIZE - bufPosn, (message[2] == '1') ? "G " : "g ");
+  */
 }
 
 void checkDHW() {      // Test if any demand for DHW - if so then send message to turn on recirc      

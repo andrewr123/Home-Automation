@@ -379,21 +379,23 @@ void loop(void) {
     prevTime = prevTime + HEARTBEAT_FREQ_MS;                  // Avoid normal = millis() to allow catchup
     heartBeatSecs++;                                          // Eventual overflow @ 64k not material
 
-	if (heartBeatSecs % ONE_MINUTE == 0) {
-		minsInMode++;
-		if (timeReceived) {									// Should be received every 30 secs if all well
-			minsSinceComms = 0;
-			timeReceived = FALSE;
-		}
-		else {
-			minsSinceComms++;
-			if (minsSinceComms > COMMS_TIMEOUT_MINS) {			// 5 mins and no time signal; assume comms problem
-				systemMode = ERROR;							
-				minsInMode = 0;
-			}
-		}
-	}
-    
+    /*
+	  if (heartBeatSecs % ONE_MINUTE == 0) {
+		    minsInMode++;
+		    if (timeReceived) {									// Should be received every 30 secs if all well
+			      minsSinceComms = 0;
+			      timeReceived = FALSE;
+		    }
+		    else {
+			      minsSinceComms++;
+			      if (minsSinceComms > COMMS_TIMEOUT_MINS) {			// 5 mins and no time signal; assume comms problem
+				    systemMode = ERROR;							
+				    minsInMode = 0;
+			      }
+		    }
+	  }
+    */
+
     if (heartBeatSecs % DHW_DEMAND_CHECK_FREQ == 0) controlRecirc();       // If DHW demand then turn on recirc pump & start countdown timer
     
     if (heartBeatSecs % UFH_TEMP_CHECK_FREQ == 0) {           // Runs more frequently than main temp check loop to avoid over/under shoot on mixer valve
@@ -454,14 +456,14 @@ void setSystemMode() {                                // Sets the system mode.  
 				if (!anyZoneDemand) systemMode = DORMANT;  
       break;
 
-	case ERROR:
+	case ERROR:  /*
 		if (minsSinceComms < COMMS_TIMEOUT_MINS) systemMode = DORMANT;		// If comms restored then can restart
     else {                                                            // Continuing error - re-start TWI
         // Re-start Two Wire Interface, with this as device #2 - added Jun 20
         Wire.begin(2);
         Wire.onRequest(reportStatus);
         Wire.onReceive(receiveData);
-    }
+    }  */
 		break;
       
     case QUIESING:
@@ -1083,9 +1085,9 @@ void receiveData(int howMany) {
     byte switchVal = 0;
     
     switch (mode) {
-		case 'B':
-			centibars = command;
-			break;
+		    case 'B':
+			    centibars = command;
+			    break;
 
       case 'D':              // DHW demand - 1 == yes, 0 == no
         switch (command) {
@@ -1145,23 +1147,23 @@ void receiveData(int howMany) {
 
       case 'T':                                // Time in dhm format
         timeNow = (unsigned int)command << 8 | Wire.read();
-		timeReceived = TRUE;		// Keeps watchdog happy
+		    // timeReceived = TRUE;		// Keeps watchdog happy
                 
         // Once a week, set DHW temp higher to counter Legionella
-        dhwMaxTemp = (dhmGet(timeNow, VAL_DAY) == 2) ? DHW_HIGH_TEMP : DHW_NORM_TEMP;    // Monday is day 2 (can be any day, but avoid weekends when more water consumption)
+        // dhwMaxTemp = (dhmGet(timeNow, VAL_DAY) == 2) ? DHW_HIGH_TEMP : DHW_NORM_TEMP;    // Monday is day 2 (can be any day, but avoid weekends when more water consumption)
      
         break;
         
       case 'Z':              // Zone heat demand - yes/no
-		switch (command) {
-			case 'K': switchVal = ZONE_KITCHEN; break;
-			case 'G': switchVal = ZONE_GT_HALL; break;
-			case 'B': switchVal = ZONE_BASEMENT; break;
-			case 'D': switchVal = ZONE_DINING; break;
-			case 'S': switchVal = ZONE_STUDY; break;
-			default:  switchVal = 0; break;
-		}
-		(Wire.read() == '1') ? anyZoneDemand |= switchVal : anyZoneDemand &= ~switchVal;
+		    switch (command) {
+			    case 'K': switchVal = ZONE_KITCHEN; break;
+			    case 'G': switchVal = ZONE_GT_HALL; break;
+			    case 'B': switchVal = ZONE_BASEMENT; break;
+			    case 'D': switchVal = ZONE_DINING; break;
+			    case 'S': switchVal = ZONE_STUDY; break;
+			    default:  switchVal = 0; break;
+		    }
+		    (Wire.read() == '1') ? anyZoneDemand |= switchVal : anyZoneDemand &= ~switchVal;
 
         break;
     }    
@@ -1183,7 +1185,7 @@ void reportStatus() {
 	byte limit;
 
 	switch (statusSelect) {
-		case 'D':
+		case 'D':                   // DHW demand for recirc
 			limit = NUM_DHW - 1;
 
 			BUF_ADD "{\"DA\":\"%c%c\",", meInit, statusSelect);
@@ -1193,11 +1195,11 @@ void reportStatus() {
 			BUF_ADD "\"T\":\"%d\"}\0", relayOn(DHW_RECIRC_PUMP) ? (DHW_TIMEOUT - (heartBeatSecs - recircStart)) / 60 : 0);
 			break;
 
-		case 'M':
+		case 'M':                   // Current mode
 			BUF_ADD "{\"DA\":\"%c%c\",\"%c\":\"%c\"}\0", meInit, statusSelect, statusSelect, modeTag[systemMode]);
 			break;
 
-		case 'R':
+		case 'R':                   // Relay/pump status
 			limit = NUM_RELAYS - 1;
 
 			BUF_ADD "{\"DA\":\"%c%c\",", meInit, statusSelect);
@@ -1207,12 +1209,12 @@ void reportStatus() {
 			}
 			break;
 
-		case 'S':
+		case 'S':                   // Status display, line 'displaySelect'
 			for (int i = 0; i < NUM_COLS; i++) buffer[i] = statusMap[displaySelect][i];
 			bufPosn = NUM_COLS + 1;
 			break;
 
-		case 'T':
+		case 'T':                   // Current temperatures
 			limit = NUM_SENSORS - 1;
 
 			BUF_ADD "{\"DA\":\"%c%c\",", meInit, statusSelect);
@@ -1223,7 +1225,7 @@ void reportStatus() {
 			}
 			break;
 
-		case 'Z':
+		case 'Z':                   // Target temperatures
 			limit = NUM_ZONES - 1;
 
 			BUF_ADD "{\"DA\":\"%c%c\",", meInit, statusSelect);

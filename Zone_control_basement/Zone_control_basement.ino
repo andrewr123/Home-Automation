@@ -1,4 +1,6 @@
 /* Zone control for Basement zones
+* 
+* - Multiple errors  <<-----
 
 Version history
 ---------------
@@ -343,12 +345,11 @@ void acceptInput() {
 	
 	while (dataLen = ard.get(buffer, UDP_TX_PACKET_MAX_SIZE)) {        // If data available - multiple messages potentially
 	
-		/* Jul 20 - omit for now
+
 		if (sendToSyslog) {
 			if (dataLen <= UDP_TX_PACKET_MAX_SIZE) buffer[dataLen] = 0x00;
 			SENDLOGM('N', buffer);
 		}
-		*/
 
 		if (numMsgs++ > MAX_MSGS) {
 			SENDLOGM('W', "Max msgs exceeded");
@@ -444,19 +445,18 @@ void checkTime() {		// Get current time, pass it to boiler, and determine if any
 	for (int i = 0; i < 3; i++) Wire.write(buffer[i]);
 	Wire.endTransmission();  
 
-	// . . . and to syslog
-	/* Jul 20 - omit for now 
+	// . . . and to syslog 
 	if (sendToSyslog) {
 		char timeText[30];
 		int bufEnd = snprintf(timeText, 30, "T %04X ", timeNow);
 		dhmToText(timeNow, timeText + bufEnd);
 		SENDLOGM('N', timeText);
 	}
-	*/
 
 	// Test if UFH zones are on or off; may change value of forecOn
 	onPeriodU = isOn(ZONE_UFH, timePatternU, onPeriodU);		
-													
+	
+	/*
 	// Send to other arudinos (which then send zone demand if required)
 	buffer[0] = 'O';
 	buffer[1] = (onPeriodU) ? '1' : '0';
@@ -464,9 +464,10 @@ void checkTime() {		// Get current time, pass it to boiler, and determine if any
 
 	ard.put(studyIP, UdpArdPort, buffer, 3);
 	ard.put(diningIP, UdpArdPort, buffer, 3);  // Remove - this is redundant
-
+	
 	// Send to syslog
-	// if (sendToSyslog) SENDLOGM('N', buffer);
+	if (sendToSyslog) SENDLOGM('N', buffer);
+	*/
 
 	// Convenient point to tell boiler what time pattern to display (& copy to syslog)
 	buffer[0] = 'P';
@@ -480,6 +481,7 @@ void checkTime() {		// Get current time, pass it to boiler, and determine if any
 
 	// if (sendToSyslog) SENDLOGM('N', buffer);
 	
+	/*
 	// Test if DHW is scheduled to be on or off & tell boiler (which then determines if DHW 'zone' has demand)
 	onPeriodH = isOn(ZONE_DHW, timePatternH, onPeriodH);			// Used directly to turn on/off DHW
 
@@ -490,6 +492,7 @@ void checkTime() {		// Get current time, pass it to boiler, and determine if any
 	Wire.beginTransmission(2);  
 	for (int i = 0; i < 2; i++) Wire.write(buffer[i]);
 	Wire.endTransmission();  
+	*/
 
 	// if (sendToSyslog) SENDLOGM('N', buffer);
 
@@ -528,29 +531,28 @@ void checkBasement() {      // See if basement wants more heat - tell boiler
 	RESTORE_CONTEXT
 }
 
-
 void reportStatus() {
-
 
 	SAVE_CONTEXT("rStat")
 
 	int msgLen = 0;
   
   for (int i = 0; i < 4; i++) {
-    // Get latest status
-    Wire.beginTransmission(2);
-    Wire.write('S');                // Set displayRow in Boiler_control
-    Wire.write('S');
-    Wire.write(i);
-    Wire.endTransmission();
-    
-	if (msgLen = Wire.requestFrom(2, UDP_TX_PACKET_MAX_SIZE)) {
-		for (int i = 0; i < msgLen; i++) buffer[i] = Wire.read();
-	}
+		// Get latest status
+		Wire.beginTransmission(2);
+		Wire.write('S');                // Set displayRow in Boiler_control
+		Wire.write('S');
+		Wire.write(i);
+		Wire.endTransmission();
 
-	buffer[20] = 0x00;				// Mark end of data
+		if (msgLen = Wire.requestFrom(2, UDP_TX_PACKET_MAX_SIZE)) {
+				for (int i = 0; i < msgLen; i++) buffer[i] = Wire.read();
+				if (msgLen == 0 && sendToSyslog) SENDLOGM('N', "No status from boiler");
+		}
+
+		buffer[20] = 0x00;				// Mark end of data
     
-    if (sendToSyslog) SENDLOGM('N', buffer);
+		if (sendToSyslog) SENDLOGM('N', buffer);
   }
 
 	RESTORE_CONTEXT
