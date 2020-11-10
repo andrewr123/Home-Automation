@@ -1,19 +1,23 @@
-/* Zone control for Basement zones
+/* Zone control for Basement
 
 Version history
 ---------------
 
-Apr 13 - v1 - baseline version
-Feb 15 - v2 - incorporate time pattern handler from boiler control
+Apr 13	- v1 - baseline version
+Feb 15	- v2 - incorporate time pattern handler from boiler control
             - add bi-directional UDP comms to pass back status info
-Apr 15 - v3 - add time response
-Dec 16 - v4 - revised timing of Allday and Background
-			- internal generation of timeNow
-			- independent schedule for hot water
-			- pressure sensor input
-Jan 17 - Dining controller changed to ignore onPeriod signal - independent timing
-Jan 18 - MAX_MSGS in acceptInput doubled to avoid missing messages
-Jul 20 - Watchdog timout implemented.  ICMPPING references removed to allow compatibility with new Ethernet library. Reduced volume of syslog events
+Apr 15	- v3 - add time response
+Dec 16	- v4 - revised timing of Allday and Background
+				- internal generation of timeNow
+				- independent schedule for hot water
+				- pressure sensor input
+Jan 17	- Dining controller changed to ignore onPeriod signal - independent timing
+Jan 18	- MAX_MSGS in acceptInput doubled to avoid missing messages
+Jul 20	- Watchdog timout implemented.  ICMPPING references removed to allow compatibility with new Ethernet library. Reduced volume of syslog events
+Nov 20	- sendToSyslog Y/N replaced with syslogLevel
+				- DWH zone removed (now done by boiler)
+				- Basement zone removed (restore when reliable)
+				- TWI interface	with boiler controller re-engineered
 
 
 Current functionality 
@@ -21,27 +25,22 @@ Current functionality
 - interrogates water pressure sensor
 
 UDP commands: 
-- "Xm"   - where m is '1' to switch on reflection of messages, '0' to turn off
-- "Fn"   - force heating ON (1) or OFF (!1)
+- "Xs"   - where s is one of XACEWNID to indicate severity of logs to be logged
 - "Ss"   - request status
-- "Tnn"  - current time, where nn is unsigned int holding dhm-formatted day-hour-time (from Study)
+- "Tnn"  - current time, where nn is unsigned int holding dhm-formatted day-hour-time
 
 All other UDP messages passed to boiler unchanged
 
-To do:
-
-- implement time test and notify boiler
-- adjust to standard .h files
-- frost protection mode
-
 */
+
+
+#define UDP_TX_PACKET_MAX_SIZE 128			// Override the default 24
+#define TWI_BUFFER_SIZE 128		
 
 #include <avr/wdt.h>
 #include <SPI.h>
 #include "Ethernet.h"
-#define UDP_TX_PACKET_MAX_SIZE 128			// Override the default 24
 #include <EthernetUdp.h>
-// #include <ICMPPing.h>  // Not needed for Basement and uses classes no longer available in Ethernet library
 
 #include "HA_globals.h"
 #include "HA_syslog.h"         // For syslog comms
@@ -54,65 +53,31 @@ To do:
 #include "TimeLib.h"
 #include "Wakeup.h"
 #include "TimerOne.h"
+			
 
-
-boolean sendToSyslog = true;
-
-// ICMPPing ping;
-
-char buffer[UDP_TX_PACKET_MAX_SIZE];        // Max allowed by libraries, set in EthernetUdp.h 
 
 // ****** Identity of this controller ******
 
 #define meIP basementIP                     
 #define meMac basementMac
-char meName[]									= "Basement";
-const static char meInit			= 'B';
+char meName[] = "Basement";
+const static char meInit = 'B';
 
+// ***** External comms *****
+
+char syslogLevel = 'W';				// Available flags - XACEWNID
+
+// ***** Wire *****
+
+volatile boolean incomingI2C;
+volatile int incomingSize;
+#define I2C_ADDR_BOILER 2
+#define I2C_ADDR_BASEMENT 1
+ 
 // ******  Time ******
-
-// Current time is updated every 30 secs
+// Current time is updated every 30 secs ...
 
 unsigned int timeNow = 0;
-
-// ***************** Zones ***************
-/*
-const byte ZONE_KITCHEN = 0;
-const byte ZONE_GT_HALL = 1;
-const byte ZONE_BASEMENT = 2;
-const byte ZONE_DINING = 3;
-const byte ZONE_STUDY = 4;
-const byte ZONE_DHW = 5;
-const char zoneTag[] = { 'K', 'G', 'B', 'D', 'S', 'H' };
-const byte NUM_ZONES = 6;
-*/
-
-// Time patterns define whether UFH is ON or OFF (DHW has only one pattern at present
-
-const byte NUM_INDEP_ZONES			  = 2;			// UFH (generic) and ZONE_DWH
-const byte ZONE_UFH = 0;							// UFH zones
-const byte ZONE_DHW = 1;							// Domestic Hot Water
-
-const byte NUM_TIME_PATTERNS          = 3;          // Number of different time patterns permitted
-const byte ALLDAY = 0;								// 6am - 11pm
-const byte BACKGROUND = 1;						// Start and end of day
-const byte TURNOFF = 2;	 							// Turn off
-const char timePatternTag[] = { 'A', 'B', 'X' };
-byte timePatternU = BACKGROUND;						// Initial settings
-byte timePatternH = ALLDAY;
-
-const byte MAX_TIME_PERIODS           = 5;           // Number of ON periods allowed per day per time pattern
-
-// Values set in setupHA()
-unsigned int timePeriodStart[NUM_INDEP_ZONES][NUM_TIME_PATTERNS][MAX_TIME_PERIODS];        // Start of time period
-unsigned int timePeriodEnd[NUM_INDEP_ZONES][NUM_TIME_PATTERNS][MAX_TIME_PERIODS];          // End of time period
-byte numTimePeriods[NUM_INDEP_ZONES][NUM_TIME_PATTERNS];
-
-// Flags calculated with reference to current time and time patterns determine if heating is ON or OFF
-
-boolean onPeriodU = false;                           // True if UFH zones scheduled to be on (now only for S & B)
-boolean onPeriodH = false;							 // True if ZONE_DHW scheduled to be on
-boolean forceOn = false;                             // True if OFF period overriden (by message).  Reset with next ON period
 
 // ******   Internal timing - nothing to do with real time   *******
 
@@ -122,17 +87,12 @@ const unsigned int HEARTBEAT_FREQ_MS       = 200;		// 5 heartbeats per second
 const unsigned int CHECK_INPUT_FREQ        = 2;			// Check for messages to pass on to boiler every 400mS
 const unsigned int GET_STATUS_FREQ         = 50;		// Get status from boiler every 10 secs
 const unsigned int CHECK_MANIFOLD_FREQ     = 5;			// Check if basement needs heat and alert boiler
-const unsigned int CHECK_PRESSURE_FREQ     = 35;		// Read pressure sensor
-const unsigned int CHECK_TIME_FREQ		   = 30;		// Work out current time every 30 secs and act on it
+const unsigned int CHECK_PRESSURE_FREQ     = 50;		// Read pressure sensor every 10 secs
+const unsigned int CHECK_TIME_FREQ		   = 150;		// Work out current time every 30 secs and act on it
 
 //  ****** Pin assignments ************
 
-const static byte BASEMENT_SENSOR          = 11;		// High if Basement manifold wants heat
 const static byte PRESSURE_SENSOR		   = A0;		// To read 4-20mA signal from pressure sensor using 250ohm shunt (1-5v)
-
-// ****** Manifold sensors ******
-
-byte basementManifold                      = OFF;
 
 // ****** Pressure sensor - based on WIKA A-10 sensor 0-2.5 bar reading using 4-20mA signal across 250ohm series resistor (in practice, is 240ohm) *****
 
@@ -141,35 +101,33 @@ const static unsigned int DYNAMIC_RANGE_TICKS = 1023 - ZERO_BAR_TICKS;
 const static unsigned int DYNAMIC_RANGE_CENTIBAR = 250;			// 2.5 bar
 byte centibars = 0;
 
+// **** Megacore code to preserve internal registers to determine restart reason ****
 /*
-   Code added from https://github.com/Optiboot/optiboot/blob/master/optiboot/examples/test_reset/test_reset.ino
+	 Code added from https://github.com/Optiboot/optiboot/blob/master/optiboot/examples/test_reset/test_reset.ino
 
-   First, we need a variable to hold the reset cause that can be written before
-   early sketch initialization (that might change r2), and won't be reset by the
-   various initialization code.
-   avr-gcc provides for this via the ".noinit" section.
+	 First, we need a variable to hold the reset cause that can be written before early sketch initialization
+	 (which might change r2), and won't be reset by the various initialization code.
+	 avr-gcc provides for this via the ".noinit" section.
 */
-uint8_t resetFlag __attribute__ ((section(".noinit")));
+uint8_t resetFlag __attribute__((section(".noinit")));
 
 /*
-   Next, we need to put some code to save reset cause from the bootload (in r2)
-   to the variable.  Again, avr-gcc provides special code sections for this.
-   If compiled with link time optimization (-flto), as done by the Arduno
-   IDE version 1.6 and higher, we need the "used" attribute to prevent this
-   from being omitted.
+	 Next, we need to put some code to save reset cause from the bootload (in r2) to the variable. Again, avr-gcc
+	 provides special code sections for this.  If compiled with link time optimization (-flto), as done by the
+	 Arduno IDE version 1.6 and higher, we need the "used" attribute to prevent this from being omitted.
 */
-void resetFlagsInit(void) __attribute__ ((naked))
-__attribute__ ((used))
-__attribute__ ((section (".init0")));
+void resetFlagsInit(void) __attribute__((naked))
+__attribute__((used))
+__attribute__((section(".init0")));
 void resetFlagsInit(void)
 {
-  /*
-     save the reset flags passed from the bootloader
-     This is a "simple" matter of storing (STS) r2 in the special variable
-     that we have created.  We use assembler to access the right variable.
-  */
-  __asm__ __volatile__ ("sts %0, r2\n" : "=m" (resetFlag) :);
+		/*
+			 save the reset flags passed from the bootloader.  This is a "simple" matter of storing (STS) r2 in the
+			 special variable that we have created.  We use assembler to access the right variable.
+		*/
+		__asm__ __volatile__("sts %0, r2\n" : "=m" (resetFlag) : );
 }
+
 
 void setup() {
 
@@ -178,24 +136,21 @@ void setup() {
   MCUSR = 0;
   wdt_disable();
 
-	// Disable the SD CS to avoid interference with UDP transmission - http://arduino.cc/forum/index.php?action=printpage;topic=96651.0
-	// And ensure SPI CS pin is set to output to avoid problems with SD card
-	pinMode(SD_CS_PIN, OUTPUT);
-	digitalWrite(SD_CS_PIN, HIGH);
-	pinMode(SPI_CS_PIN, OUTPUT);
+	// Startup actions
+	/*
+	Serial.begin(9600);
+	Serial.println("Starting");
+	*/
 
-	// start the Ethernet connection
-	Ethernet.begin(meMac, meIP);
-
-	// Initialise UDP comms
-	syslog.init(UdpLogPort, syslogServerIP, syslogServerPort, 'I');
-	ard.init(UdpArdPort);
-
-	// Standard setup actions
-	setupHA();
+	setupComms();
+	logStartupReason();
+	setupBoilerSupport();
 
   // Start watchdog
   wdt_enable(WDTO_8S);
+
+	// Start the relative clock
+	prevTime = millis();
 }
 
 
@@ -204,20 +159,17 @@ void loop() {
   // Reset watchdog - if fault then this won't happen and watchdog will fire, restarting the sketch
   wdt_reset();
 
-  // Increment heartbeat every second 
+  // Increment heartbeat every 200 mS
   if ((millis() - prevTime) >= HEARTBEAT_FREQ_MS) {   
 
     prevTime = millis();                  
     heartBeatSecs++;                                          
 
     // See if any commands from console or other arduinos
-    if (heartBeatSecs % CHECK_INPUT_FREQ == 0) acceptInput();
+    if (heartBeatSecs % CHECK_INPUT_FREQ == 0) processIncomingUDP();
 
 		// Calculate current time and pass it on
 		if (heartBeatSecs % CHECK_TIME_FREQ == 0) checkTime();
-
-    // See if basement is demanding heat
-    if (heartBeatSecs % CHECK_MANIFOLD_FREQ == 0) checkBasement();
  
     // Get status from boiler and report to syslog
     if (heartBeatSecs % GET_STATUS_FREQ == 0) reportStatus();
@@ -226,331 +178,216 @@ void loop() {
     if (heartBeatSecs % CHECK_PRESSURE_FREQ == 0) checkPressure();
 
   }
-  
-  delay(50);
 }
 
-void setupHA() {
+void setupComms() {
 
-  int myMCUSR;    // Startup reason
-    
-  // Load timePeriod patterns for UFH - Day 0 == Everyday, Day 10 == Sat/Sun
-  // Pattern ALLDAY 
-  timePeriodStart[ZONE_UFH][ALLDAY][0] = dhmMake(0, 6, 0);    // 06:00
-  timePeriodEnd[ZONE_UFH][ALLDAY][0] = dhmMake(0, 23, 00);    // 23:00
-  numTimePeriods[ZONE_UFH][ALLDAY] = 1;
-  
-  // Pattern BACKGROUND 
-  timePeriodStart[ZONE_UFH][BACKGROUND][0] = dhmMake(0, 6, 0);
-  timePeriodEnd[ZONE_UFH][BACKGROUND][0] = dhmMake(0, 9, 0);
-  timePeriodStart[ZONE_UFH][BACKGROUND][1] = dhmMake(0, 18, 0);
-  timePeriodEnd[ZONE_UFH][BACKGROUND][1] = dhmMake(0, 23, 00);
-  timePeriodStart[ZONE_UFH][BACKGROUND][2] = dhmMake(10, 6, 0);	
-  timePeriodEnd[ZONE_UFH][BACKGROUND][2] = dhmMake(10, 23, 00);
-  numTimePeriods[ZONE_UFH][BACKGROUND] = 3;
+		char logMsg[UDP_TX_PACKET_MAX_SIZE];
 
-  // UFH TURNOFF
-  numTimePeriods[ZONE_UFH][TURNOFF] = 0;
-  
-  // Load patterns for ZONE_DHW
-  // DHW ALLDAY
-  timePeriodStart[ZONE_DHW][ALLDAY][0] = dhmMake(0, 6, 0);
-  timePeriodEnd[ZONE_DHW][ALLDAY][0] = dhmMake(0, 23, 0);
-  numTimePeriods[ZONE_DHW][ALLDAY] = 1;
+		/*
+				Disable the SD CS to avoid interference with UDP transmission - http://arduino.cc/forum/index.php?action=printpage;topic=96651.0
+				And ensure SPI CS pin is set to output to avoid problems with SD card	*
 
-  // DHW BACKGROUND 
-  timePeriodStart[ZONE_DHW][BACKGROUND][0] = dhmMake(0, 6, 0);
-  timePeriodEnd[ZONE_DHW][BACKGROUND][0] = dhmMake(0, 9, 0);
-  timePeriodStart[ZONE_DHW][BACKGROUND][1] = dhmMake(0, 12, 0);
-  timePeriodEnd[ZONE_DHW][BACKGROUND][1] = dhmMake(0, 13, 0);
-  timePeriodStart[ZONE_DHW][BACKGROUND][2] = dhmMake(0, 18, 0);
-  timePeriodEnd[ZONE_DHW][BACKGROUND][2] = dhmMake(0, 23, 00);
-  numTimePeriods[ZONE_DHW][BACKGROUND] = 3;
+				From https://forum.arduino.cc/index.php?topic=20114.0
 
-  // DHW TURNOFF
-  numTimePeriods[ZONE_DHW][TURNOFF] = 0;
+				What pins does the ethernet shield really use ? According to the schematic...
 
-  // Initialise wakeup to support background daemons (eg for time)
-  wakeup.init();
+				D2 - Ethernet interrupt(optional with solder bridge "INT")
+				D4 - SD SPI CS
+				D10 - Ethernet SPI CS
+				D11 - Not connected(but should be SPI MOSI)
+				D12 - Not connected(but should be SPI MISO)
+				D13 - SPI SCK
+				A0 - SD Write Protect
+				A1 - SD Detect
 
-  // Get the time from NTP server and log startup
-  initialiseTime(UdpNTPPort);
-  timeToText(now(), buffer, UDP_TX_PACKET_MAX_SIZE);           // Get current time
+				See also: http://shieldlist.org/arduino/ethernet-v5
 
-  // Log reason for startup to SYSLOG - order of tests is significant; last succesful test is what's reported
-  
-  if (resetFlag & (1 << WDRF)) myMCUSR = WDRF;
-  if (resetFlag & (1 << EXTRF)) myMCUSR = EXTRF;
-  if (resetFlag & (1 << PORF)) myMCUSR = PORF;
+				Although not used by most SD card libraries, A0 is connected
+				to the SD slot's write protect (WP) pin and A1 is connected
+				to the card detect switch. Both are pulled high by 10k resistors
+				on the Ethernet shield. These pins therefore cannot be used for
+				analog input with the shield unless they are bent back or clipped off
+				before inserting the shield into the arduino. Additionally, if a user's
+				circuit uses these pins for digital IO, the pullups may cause problems for existing circuitry.
+		*/
+		pinMode(SD_CS_PIN, OUTPUT);
+		digitalWrite(SD_CS_PIN, HIGH);
+		pinMode(SPI_CS_PIN, OUTPUT);
 
-  switch (myMCUSR) {
-    case WDRF: 
-      SENDLOG ('I', "Restarted by watchdog @ ", buffer);
-      break;
-    case EXTRF:
-      SENDLOG ('I', "Restarted by reset @ ", buffer);
-      break;
-    case PORF:
-      SENDLOG ('I', "Restarted by power off @ ", buffer);
-      break;      
-  }
-  
-  // Initialise basement demand sensor & pressure sensor input
-  analogReference(DEFAULT);			// 5v max
-  pinMode(BASEMENT_SENSOR, INPUT);			// In practice not connected - noise on line made it unreliable
-  pinMode(PRESSURE_SENSOR, INPUT);
+		// start the Ethernet connection
+		Ethernet.begin(meMac, meIP);
 
-  // Start the i2c bus
-  Wire.begin();
+		// Initialise UDP comms
+		syslog.init(UdpLogPort, syslogServerIP, syslogServerPort, syslogLevel);
+		ard.init(UdpArdPort);
 
-  // Capture relative time
-  prevTime = millis();
+		// Initialise wakeup to support background daemons (eg for time)
+		wakeup.init();
+
+		// Get the time from NTP server
+		initialiseTime(UdpNTPPort);
+		timeToText(now(), logMsg, UDP_TX_PACKET_MAX_SIZE);           // Get current time
 }
 
-/* ***** acceptInput from network *****
+void logStartupReason() {
 
-Valid inputs:
+		// Log reason for startup to SYSLOG by testing resetFlag made available on startup - see Megacore refs above
 
-Fn    Force heating ON (n == '1') or OFF (n != '1').  Auto cancels at start of next programmed ON period
-Pzp   Set time pattern for zone type, z == U or H, p == A, B or X
-Ss    Status request; some answered directly, most answered by boiler controller.  All answers in JSON.  Valid values for 's' request:
-      - B = bar pressure in primary circuit
-	    - D = DHW demand
-      - P = current timePattern (A, B etc) - answered here
-      - R = Relay settings
-      - T = Temperature
-      - Z = Zone demand
-Ttt   Time as an unsigned integer (high and low) in dhm format - no longer used, but Study still sends so make noop
-Xn    Switch ON or OFF syslog reporting
+		int myMCUSR;    // Startup reason
+		char logMsg[UDP_TX_PACKET_MAX_SIZE];
 
-Others passed directly to Boiler Control
+		// Order of tests is significant; last succesful test is what's reported
+		if (resetFlag & (1 << WDRF)) myMCUSR = WDRF;				// Watchdog reset
+		if (resetFlag & (1 << EXTRF)) myMCUSR = EXTRF;			// Manual reset
+		if (resetFlag & (1 << PORF)) myMCUSR = PORF;				// Power-on reset
 
-Dzf    - DHW demand for heat - zone z either on (f == '1') or off (f != '1')
-Mmf    - manual mode - direct control.  On (f == '1') or Off (f != '1')
-Zzf    - Zone demand for heat - zone z either on (f == '1') or off (f != '1')
-
-*/
-
-void acceptInput() {
-	SAVE_CONTEXT("aInp")
-  
-	const byte MAX_MSGS = 10;						  // Max msgs to process before exiting while loop; avoids continual loop
-	byte numMsgs = 0;
-	unsigned int bufPosn, dataLen;							
-	char timeText[30];
-	char zone;
-	#define BUF_ADD bufPosn += snprintf(buffer + bufPosn, UDP_TX_PACKET_MAX_SIZE - bufPosn,      // Take care; buffer used for input & output
-	
-	while (dataLen = ard.get(buffer, UDP_TX_PACKET_MAX_SIZE)) {        // If data available - multiple messages potentially
-	
-		/* Jul 20 - omit for now
-		if (sendToSyslog) {
-			if (dataLen <= UDP_TX_PACKET_MAX_SIZE) buffer[dataLen] = 0x00;
-			SENDLOGM('N', buffer);
+		switch (myMCUSR) {
+		case WDRF:
+				SENDLOG('W', "Restarted by watchdog @ ", logMsg);
+				break;
+		case EXTRF:
+				SENDLOG('W', "Restarted by reset @ ", logMsg);
+				break;
+		case PORF:
+				SENDLOG('W', "Restarted by power off @ ", logMsg);
+				break;
 		}
+}
+
+void setupBoilerSupport () {
+
+		// Initialise pressure sensor input
+		analogReference(DEFAULT);			// 5v max
+		pinMode(PRESSURE_SENSOR, INPUT);
+}
+
+
+void processIncomingUDP() {
+
+		/* ***** process incoming from network *****
+
+		Valid inputs:
+
+		Ss    Status request; most answered by boiler controller.  All answers in JSON.  Valid values for 's' request:
+						- B = bar pressure in primary circuit (answered here)
+						- R = Relay settings
+						- T = Temperature
+						- Z = Zone demand
+		Xn    Set syslog reporting level
+
+		Others passed directly to Boiler Control
+
+		Dzf    - DHW demand for heat - zone z either on (f == '1') or off (f != '1')
+		Mmf    - manual mode - direct control.  On (f == '1') or Off (f != '1')
+		Zzf    - Zone demand for heat - zone z either on (f == '1') or off (f != '1')
+
 		*/
 
-		if (numMsgs++ > MAX_MSGS) {
-			SENDLOGM('W', "Max msgs exceeded");
-			return;
-		}
+		SAVE_CONTEXT("aInp")
+  
+		const byte MAX_MSGS = 10;						  // Max msgs to process before exiting while loop; avoids continual loop
+		byte numMsgs = 0;
+		unsigned int dataLen;							
+		char timeText[30];
+		char zone;
+		int wireStatus;
 
-		bufPosn = 0;										// Position to start of buffer for output & overwriting redundant input
-
-		switch (buffer[0]) {
-
-			case 'F':								// Force heating on/off  
-				forceOn = (buffer[1] == '1');		// Gets picked up at next time refresh
-				break;
-
-			case 'P':        // Set timePattern for UFH & DHW - gets sent to boiler controller at next time refresh
-				zone = buffer[1]; 
-				
-				switch (buffer[2]) {
-					case 'A':    (zone == 'U') ? timePatternU = ALLDAY : timePatternH = ALLDAY; break;
-					case 'B':    (zone == 'U') ? timePatternU = BACKGROUND : timePatternH = BACKGROUND; break;
-					case 'X':	 (zone == 'U') ? timePatternU = TURNOFF : timePatternH = TURNOFF; break;
-					default:     SENDLOGM('W', "Invalid timePattern");
-				}
-				break;
-
-			case 'S':        // External status request.  Two answered directly, the rest by boiler controller.  
-
-				switch (buffer[1]) {
-					case 'B':
-						BUF_ADD "{\"DA\":\"%c%c\",\"%c\":\"%d.%d\"}\0", meInit, 'B', 'B', centibars / 100, centibars % 100);
-						break;
-
-					case 'P':            // Current timePattern & time - handled locally
-						dhmToText(timeNow, timeText);
-						BUF_ADD "{\"DA\":\"%c%c\",\"%c\":\"%c%c\"", meInit, 'P', 'P', (forceOn) ? 'F' : (onPeriodU) ? timePatternTag[timePatternU] : timePatternTag[timePatternU] + 32, (onPeriodH) ? timePatternTag[timePatternH] : timePatternTag[timePatternH] + 32);
-						BUF_ADD ",\"T\":\"%s\"}\0", timeText);
-						break;
-
-					default:            // All others handled by boiler controller
-						Wire.beginTransmission(2);   // transmit to device #2
-						for (int i = 0; i < 2; i++) Wire.write(buffer[i]);
-						Wire.endTransmission();      // stop transmitting
-
-						// Get response from controller        
-						if (bufPosn = Wire.requestFrom(2, UDP_TX_PACKET_MAX_SIZE)) {
-							for (int i = 0; i < bufPosn; i++) buffer[i] = Wire.read();
-						};
-
-						bufPosn = strchr(buffer, '\0') - buffer;		// Shouldn't be needed, but Wire always seems to return full buffer length
-
-						break;
+		byte bufPosn;
+		char buffer[TWI_BUFFER_SIZE];
+		#define BUF_ADD bufPosn += snprintf(buffer + bufPosn, TWI_BUFFER_SIZE - bufPosn,      // Take care; buffer used for input & output
+	
+		while (dataLen = ard.get(buffer, TWI_BUFFER_SIZE)) {        // If data available - multiple messages potentially
+	
+				if (dataLen <= TWI_BUFFER_SIZE) buffer[dataLen] = 0x00;
+				SENDLOGM('D', buffer);
+		
+				if (numMsgs++ > MAX_MSGS) {
+					SENDLOGM('W', "Max msgs exceeded");
+					return;
 				}
 
-				// Reply to requestor
-				ard.reply(REPLY_PORT, buffer, bufPosn);
+				bufPosn = 0;										// Position to start of buffer for output & overwriting redundant input
 
-				// Copy to syslog
-				if (sendToSyslog) SENDLOGM('N', buffer);
+				switch (buffer[0]) {
 
-				break;
+					case 'S':											// External status request.  One answered directly, the rest by boiler controller.  
+						switch (buffer[1]) {				// Specific status requested
+							case 'B':
+								BUF_ADD "{\"DA\":\"%c%c\",\"%c\":\"%d.%d\"}\0", meInit, 'B', 'B', centibars / 100, centibars % 100);
+								break;
 
-			case 'T':			// Ignore redundant timestamp from Study
-				break;
+							default:            // All others handled by boiler controller
+								bufPosn = boilerI2C(buffer, 2, buffer);
 
-			case 'X':
-				sendToSyslog = (buffer[1] == '1');
-				break;
+								bufPosn = strchr(buffer, '\0') - buffer;		// Shouldn't be needed, but Wire always seems to return full buffer length
 
-			default:
-				// Send anything else onto the boiler controller
-				Wire.beginTransmission(2);  
-				for (int i = 0; i < 3; i++) Wire.write(buffer[i]);
-				Wire.endTransmission();     
+																																																																																break;
+						}
+
+						// Reply to requestor
+						ard.reply(REPLY_PORT, buffer, bufPosn);
+
+						// Copy to syslog
+						SENDLOGM('D', buffer);
+
+						break;
+
+					case 'X':
+						syslogLevel = buffer[1];
+						syslog.adjustLevel(syslogLevel);
+						break;
+
+					default:
+						// Send anything else onto the boiler controller
+						boilerI2C(buffer, 3, NULL);
+				}
 		}
-	}
 
-	RESTORE_CONTEXT
+		RESTORE_CONTEXT
 }
 
-void checkTime() {		// Get current time, pass it to boiler, and determine if anything needs to happen
+void checkTime() {		// Get current time and pass it to boiler
 	SAVE_CONTEXT("CheckT")
+
+	char buffer[TWI_BUFFER_SIZE];
 
 	// Get current time & pack into dhm format
 	timeNow = dhmMake(weekday(), hour(), minute());
 
-	// Send time to boiler controller
 	buffer[0] = 'T';
 	buffer[1] = timeNow >> 8;
 	buffer[2] = timeNow & 0x00ff;
 	buffer[3] = 0x00;
 
-	Wire.beginTransmission(2); 
-	for (int i = 0; i < 3; i++) Wire.write(buffer[i]);
-	Wire.endTransmission();  
+	// Send time to boiler controller
+	boilerI2C(buffer, 3, NULL);
 
-	// . . . and to syslog
-	/* Jul 20 - omit for now 
-	if (sendToSyslog) {
-		char timeText[30];
-		int bufEnd = snprintf(timeText, 30, "T %04X ", timeNow);
-		dhmToText(timeNow, timeText + bufEnd);
-		SENDLOGM('N', timeText);
-	}
-	*/
-
-	// Test if UFH zones are on or off; may change value of forecOn
-	onPeriodU = isOn(ZONE_UFH, timePatternU, onPeriodU);		
-													
-	// Send to other arudinos (which then send zone demand if required)
-	buffer[0] = 'O';
-	buffer[1] = (onPeriodU) ? '1' : '0';
-	buffer[2] = 0x00;
-
-	ard.put(studyIP, UdpArdPort, buffer, 3);
-	ard.put(diningIP, UdpArdPort, buffer, 3);  // Remove - this is redundant
-
-	// Send to syslog
-	// if (sendToSyslog) SENDLOGM('N', buffer);
-
-	// Convenient point to tell boiler what time pattern to display (& copy to syslog)
-	buffer[0] = 'P';
-	buffer[1] = (forceOn) ? 'F' : timePatternTag[timePatternU];
-	buffer[2] = timePatternTag[timePatternH];
-	buffer[3] = 0x00;
-
-	Wire.beginTransmission(2);
-	for (int i = 0; i < 3; i++) Wire.write(buffer[i]);
-	Wire.endTransmission();
-
-	// if (sendToSyslog) SENDLOGM('N', buffer);
-	
-	// Test if DHW is scheduled to be on or off & tell boiler (which then determines if DHW 'zone' has demand)
-	onPeriodH = isOn(ZONE_DHW, timePatternH, onPeriodH);			// Used directly to turn on/off DHW
-
-	buffer[0] = 'O';
-	buffer[1] = onPeriodH ? '1' : '0';					
-	buffer[2] = 0x00;
-
-	Wire.beginTransmission(2);  
-	for (int i = 0; i < 2; i++) Wire.write(buffer[i]);
-	Wire.endTransmission();  
-
-	// if (sendToSyslog) SENDLOGM('N', buffer);
+	// . . . and to syslog 
+	int bufEnd = snprintf(buffer, TWI_BUFFER_SIZE, "T %04X ", timeNow);
+	dhmToText(timeNow, buffer + bufEnd);
+	SENDLOGM('I', buffer);
 
 	RESTORE_CONTEXT
 }
-
-boolean isOn(byte zone, byte programme, boolean currentStatus) {  // Check if zone is scheduled to be on or not
-
-	boolean newStatus = false;
-
-	// Loop through on/off periods for zone and programme to find match
-	for (int i = 0; i < numTimePeriods[zone][programme]; i++) {
-		if (newStatus = dhmBetween(timeNow, timePeriodStart[zone][programme][i], timePeriodEnd[zone][programme][i])) break;    // Exit on match
-	}
-
-	// Set/clear flags
-	if (zone == ZONE_UFH && !currentStatus && newStatus) forceOn = false;  // Clear force flag if moving from OFF to ON
-	
-	return forceOn || newStatus;
-}
-
-void checkBasement() {      // See if basement wants more heat - tell boiler
-  // Basement status based on input to motorised valve
-	SAVE_CONTEXT("cBas")
-
-  char message[] = "ZB ";
-  // basementManifold = digitalRead(BASEMENT_SENSOR);   // Jul 20 - Remove for the moment
-	basementManifold = 0;																	// Jul 20 - temporary
-  message[2] = (basementManifold && onPeriodU) ? '1' : '0';      // On or off
-
-  // Send it onto the boiler controller
-  Wire.beginTransmission(2);   
-  for (int i = 0; i < 3; i++) Wire.write(message[i]);
-  Wire.endTransmission();     
-
-	RESTORE_CONTEXT
-}
-
 
 void reportStatus() {
-
 
 	SAVE_CONTEXT("rStat")
 
 	int msgLen = 0;
+	int wireStatus;
+	char recvBuffer[TWI_BUFFER_SIZE];
+	char sendBuffer[4] = "SSx";
   
   for (int i = 0; i < 4; i++) {
-    // Get latest status
-    Wire.beginTransmission(2);
-    Wire.write('S');                // Set displayRow in Boiler_control
-    Wire.write('S');
-    Wire.write(i);
-    Wire.endTransmission();
-    
-	if (msgLen = Wire.requestFrom(2, UDP_TX_PACKET_MAX_SIZE)) {
-		for (int i = 0; i < msgLen; i++) buffer[i] = Wire.read();
-	}
+		// Get latest status
+		sendBuffer[2] = (char)i + 48;									// Select row (displaySelect in Boiler Control) - convert to ASCII to assist tracing
+		boilerI2C(sendBuffer, 3, recvBuffer);
 
-	buffer[20] = 0x00;				// Mark end of data
-    
-    if (sendToSyslog) SENDLOGM('N', buffer);
+		recvBuffer[20] = 0x00;				// Mark end of data
+
+		SENDLOGM('N', recvBuffer);								// Reflection of boiler LCD
   }
 
 	RESTORE_CONTEXT
@@ -559,33 +396,78 @@ void reportStatus() {
 void checkPressure() {					// Read primary circuit pressure & display
 	SAVE_CONTEXT("cPres")
 
+	char buffer[8];
+	int wireStatus;
+	
 	// Get ticks - 0-1023; 
 	unsigned int ticks = analogRead(PRESSURE_SENSOR);
 
 	// Do the maths to get pressure
 	centibars = ((float)(ticks - ZERO_BAR_TICKS) / (float)DYNAMIC_RANGE_TICKS) * DYNAMIC_RANGE_CENTIBAR;
 
-    // Construct message
-    buffer[0] = 'B';
-		buffer[1] = centibars;
-    buffer[2] = 0x00;  
+	// Construct message
+	buffer[0] = 'B';
+	buffer[1] = centibars;
+	buffer[2] = 0x00;  
     
-    // Send message to boiler controller
-    Wire.beginTransmission(2);  
-    for (int i = 0; i < 2; i++) Wire.write(buffer[i]);
-    Wire.endTransmission();     
-    
-    // Alert syslog
-		/*
-		if (sendToSyslog) {
-				buffer[1] = centibars / 100;
-				buffer[2] = '.';
-				buffer[3] = centibars % 100;
-				buffer[4] = 0x00;
-
-				SENDLOGM('N', buffer);
-		}
-		*/
+	// Send message to boiler controller
+	boilerI2C(buffer, 3, NULL);
 
 	RESTORE_CONTEXT
+}
+
+unsigned int boilerI2C(char* sendBuffer, int sendBuflen, char* recvBuffer) {     // Handle comms with boiler over I2C
+		
+		SAVE_CONTEXT("I2C")
+
+		unsigned int recvBuflen, wireStatus, pollCount, dataAvail;
+		const unsigned int pollLimit = 100;					// 2 seconds 
+		char localBuf[8];
+		
+		// Setup I2C bus - set as Master
+		Wire.begin();
+
+		// Send the data
+		Wire.beginTransmission(I2C_ADDR_BOILER);
+		Wire.write(sendBuffer, sendBuflen);
+		wireStatus = Wire.endTransmission();
+		if (wireStatus > 0) SENDLOG('W', "Error sending to boiler: ", wireStatus);
+
+		// Swap this controller to be slave
+		Wire.begin(I2C_ADDR_BASEMENT);
+
+		// Establish onReceive ISR
+		incomingI2C = false;
+		Wire.onReceive(processOnReceive);						// Sets incomingI2C == true when boiler controller responds
+
+		// Loop until data received/timeout
+		pollCount = 0;
+		while (pollCount++ < pollLimit && !incomingI2C) delay(20);
+		if (pollCount > 50) SENDLOG('N', "Poll count = ", pollCount);
+
+		// Read the data - often not interested, but need a positive acknowledgement from boiler
+		if (recvBuflen = Wire.available()) {
+				if (recvBuffer == NULL) {												// No data expected by calling routine, but we check handshake here
+						if (!((localBuf[0] = Wire.read()) == 'O' && (localBuf[1] = Wire.read()) == 'K')) {
+								SENDLOG('W', "NACK from boiler", localBuf)
+						}
+				}
+				else {
+						for (int i = 0; i < recvBuflen; i++) recvBuffer[i] = Wire.read();
+				}
+		}
+		else SENDLOGM('W', "No response from boiler");
+
+		RESTORE_CONTEXT
+
+		return recvBuflen;
+}
+
+// ***** TWI input ISR *****
+
+void processOnReceive(int length) {
+		// ISR to flag receipt of data from Boiler controller
+		// Real work then done by boilerI2C
+		incomingI2C = true;           // Set flag
+		incomingSize = length;         // Checked against data received
 }

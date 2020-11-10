@@ -100,6 +100,9 @@ A4 & A5 - TWI
 
 */
 
+#define TWI_BUFFER_SIZE 128							// Override twi.h definition
+
+
 #include <LiquidCrystal.h>
 #include <OneWire.h>
 #include <Wire.h>
@@ -108,22 +111,17 @@ A4 & A5 - TWI
 
 #include "HA_globals.h"
 
-// ***** System mode *****
-
-enum eSystemMode {
-	STARTUP,
-	ERROR,					  // Comms lost - shutdown
-	RUNNING,                  // Normal mode
-	QUIESING,                 // Heading to dormant, but boiler temp too high so cooling with pumps
-	DORMANT,                  // Waiting for demand signal
-	MANUAL                    // Manual override
-};
-
-eSystemMode systemMode;
-const char modeTag[] = {'S', 'E', 'R', 'Q', 'D', 'M'};
 
 // ***** Identity - on JSON strings *****
+
 const static char meInit = 'B';
+
+//  ****** Wire/TWI bus for comms with Basement controller ******
+
+volatile boolean incomingI2C;
+volatile int incomingSize;
+#define I2C_ADDR_BOILER 2
+#define I2C_ADDR_BASEMENT 1
   
 // *************  Temperature sensors - Dallas DS18B20  ***********
 
@@ -188,21 +186,21 @@ const static byte ZONE_GT_HALL       = 0x02;
 const static byte ZONE_BASEMENT      = 0x04;
 const static byte ZONE_DINING        = 0x08;
 const static byte ZONE_STUDY         = 0x10;
-const static byte ZONE_DHW           = 0x20;              // Treated as dummy zone
-const char zoneTag[]                 = {'K', 'G', 'B', 'D', 'S', 'H'};
-const static byte NUM_ZONES          = 6;
-const static byte UFH_ZONES			 = 0x1F;			// Mask to test if any UFH zones demanding heat
+const char zoneTag[]                 = {'K', 'G', 'B', 'D', 'S'};
+const static byte NUM_ZONES          = 5;
+// const static byte UFH_ZONES			 = 0x1F;			// Mask to test if any UFH zones demanding heat
 
-// *************  Boiler  ************
+/* *************  Boiler  ************
 
 const static int BOILER_MAX                = 70;           // Degrees C at which to switch off boiler
 const static int BOILER_RUN_ON_TEMP        = 75;           // If above this, then activate run-on mode to dissipate heat
 const static int BOILER_MIN                = 62;           // If below this then switch on boiler
 boolean NEWBOILER = true;  // If new boiler, then ignore boiler temperature checks
 
+*/
 // ************** PRIMARY CIRCUIT ************
 
-const static int PUMP_THRESHOLD            = 45;           // Below this don't take heat from boiler
+// const static int PUMP_THRESHOLD            = 45;           // Below this don't take heat from boiler
 
 // **************  UFH *************
 
@@ -215,7 +213,7 @@ const static byte NUM_MIXERS               = 6;
 const static int UFH_INCREMENT             = 15;           // Added to current return temperature to give target flow temperature
 const static int UFH_FLOW_MAX_TEMP         = 50;           // Degrees C at which to turn off mixer
 
-int mixerPosition;                                         // 0 - 35s open/close in theory; in practice seems closer to 40s
+//int mixerPosition;                                         // 0 - 35s open/close in theory; in practice seems closer to 40s
 byte mixerState;                                           // One of OPENING/CLOSING/STABLE/ZEROING
 int targetMixerTemp                        = 30;           // Initial value to prevent odd behaviour if starting with hot boiler
 
@@ -300,7 +298,7 @@ unsigned int heartBeatSecs                   = 0;
 unsigned int minsInMode                      = 0;
 unsigned int minsSinceComms = 0;
 const unsigned int HEARTBEAT_FREQ_MS         = 1000;     // Heartbeat every second
-const unsigned int TEMP_CHECK_FREQ           = 11;       // Check temp sensors 
+const unsigned int TEMP_CHECK_FREQ           = 10;       // Check temp sensors 
 const unsigned int UFH_TEMP_CHECK_FREQ       = 2;        // Read mixer temps
 const unsigned int LCD_RESTART_FREQ          = 30;       // Restart to overcome noise upsetting LCD - to be solved, hopefully, with better hardware design
 const unsigned int DHW_DEMAND_CHECK_FREQ     = 5;        // Check if DHW demand
@@ -326,13 +324,25 @@ const byte NUM_COLS                   = 20;          // In practice, only 19 col
 const byte NUM_ROWS                   = 4;
 char statusMap[NUM_ROWS][NUM_COLS + 1];
 BITSTRING statusChanged(NUM_ROWS * NUM_COLS);        // BV == 1 indicates status has changed since last displayed
-volatile char statusSelect;                          // Set in receiveData, used in reportStatus
-volatile int displaySelect;                          // Set in receiveData, used in reportStatus
 
 // ******  Time - updated every 30 secs in dhm format
 
-unsigned int timeNow = 0;							 // Set by HA_Time functions.  Current time in dhm format; used for display & to test for higher DHW target on Monday's
-char timePatternTag[2] = { 'X', 'X' };                       // Set by message for display purposes only.  Same as in basement controller, plus 'F' for force
+unsigned int timeNow = 0;							 // Set by HA_Time functions.  Current time in dhm format; used for display only
+
+// ***** System mode *****
+
+enum eSystemMode {
+    STARTUP,
+    ERROR,					          // Comms lost - shutdown
+    RUNNING,                  // Normal mode
+    QUIESING,                 // Heading to dormant, but boiler temp too high so cooling with pumps
+    DORMANT,                  // Waiting for demand signal
+    MANUAL                    // Manual override
+};
+
+eSystemMode systemMode;
+const char modeTag[] = { 'S', 'E', 'R', 'Q', 'D', 'M' };
+
 
 void setup(void) {
 
@@ -342,11 +352,11 @@ void setup(void) {
   
   // Start up Two Wire Interface, with this as device #2
   Wire.begin(2);
-  Wire.onRequest(reportStatus);
-  Wire.onReceive(receiveData);
+  incomingI2C = false;                         // True when Basement controller sends data
+  Wire.onReceive(processOnReceive);             // Sets incomingI2C TRUE if data sent by Basement controller
 
   // Initialise sensors
-  for (int i = 0; i < NUM_SENSORS; i++) initSensorD(i, SENSOR_PIN[i]);
+  for (int i = 0; i < NUM_SENSORS; i++) initTempSensor(i, SENSOR_PIN[i]);
   somethingWrong = 0;
     
   // Setup relay pins/driver
@@ -379,21 +389,8 @@ void loop(void) {
     prevTime = prevTime + HEARTBEAT_FREQ_MS;                  // Avoid normal = millis() to allow catchup
     heartBeatSecs++;                                          // Eventual overflow @ 64k not material
 
-	if (heartBeatSecs % ONE_MINUTE == 0) {
-		minsInMode++;
-		if (timeReceived) {									// Should be received every 30 secs if all well
-			minsSinceComms = 0;
-			timeReceived = FALSE;
-		}
-		else {
-			minsSinceComms++;
-			if (minsSinceComms > COMMS_TIMEOUT_MINS) {			// 5 mins and no time signal; assume comms problem
-				systemMode = ERROR;							
-				minsInMode = 0;
-			}
-		}
-	}
-    
+    if (heartBeatSecs % ONE_MINUTE == 0) minsInMode++;
+
     if (heartBeatSecs % DHW_DEMAND_CHECK_FREQ == 0) controlRecirc();       // If DHW demand then turn on recirc pump & start countdown timer
     
     if (heartBeatSecs % UFH_TEMP_CHECK_FREQ == 0) {           // Runs more frequently than main temp check loop to avoid over/under shoot on mixer valve
@@ -405,7 +402,7 @@ void loop(void) {
       // Attempt to restart any faulty digital sensors
       for (int i = 0; i < NUM_SENSORS; i++) if (fault(i)) {
         clearFault(i);          // Clear flag
-        initSensorD(i, SENSOR_PIN[i]);            // Attempt to re-start
+        initTempSensor(i, SENSOR_PIN[i]);            // Attempt to re-start
       }
  
       // Get latest sensor temperatures
@@ -413,9 +410,6 @@ void loop(void) {
 
       // Check boiler temp is OK and react
       controlBurner();        
-     
-      // Check domestic hot water 
- //     checkDHWStatus();
       
       // Check underfloor heating 
       controlUFHPump();
@@ -425,18 +419,18 @@ void loop(void) {
     }
               
     updateStatus();
+
+    displayStatus();
     
     if (heartBeatSecs % LCD_RESTART_FREQ == 0) {
       lcd.begin(NUM_COLS, NUM_ROWS);                
       statusChanged.setAll();                              // Causes a refresh in displayStatus
     }
     
-    displayStatus();
-    
     setSystemMode();
   }
 
-  delay(50);    
+if (incomingI2C) processIncomingI2C();            // Set by ISR processOnReceive
 }
 
 
@@ -454,14 +448,7 @@ void setSystemMode() {                                // Sets the system mode.  
 				if (!anyZoneDemand) systemMode = DORMANT;  
       break;
 
-	case ERROR:
-		if (minsSinceComms < COMMS_TIMEOUT_MINS) systemMode = DORMANT;		// If comms restored then can restart
-    else {                                                            // Continuing error - re-start TWI
-        // Re-start Two Wire Interface, with this as device #2 - added Jun 20
-        Wire.begin(2);
-        Wire.onRequest(reportStatus);
-        Wire.onReceive(receiveData);
-    }
+	case ERROR:  
 		break;
       
     case QUIESING:
@@ -488,7 +475,7 @@ void getTempAll(byte liveSensor) {
     
     if ((liveSensor & _BV(i)) && !fault(i)) {
       // Get the temperature
-      tempC[i] = getTempD(i);
+      tempC[i] = getTempC(i);
 
       // Constrain range if obviously erroneous and raise fault flag 
       if (tempC[i] > MAX_TEMP || tempC[i] < MIN_TEMP) {
@@ -500,13 +487,6 @@ void getTempAll(byte liveSensor) {
 }
 
 void controlBurner() {
-  
-  // If sensor faulty or over-temp or underpressure then shutdown
-		/*
-  if (centibars < MIN_PRESSURE) {
-    turnRelay(BURNER, OFF);
-    return;
-  }  */
 
   switch (systemMode) {
     case STARTUP:
@@ -543,10 +523,8 @@ void controlPriPump(){
       break; 
      
     case RUNNING:
-      // If demand for heat then turn on pump //, then check if boiler & DHW (if demanded) up to temp before taking heat
+      // If demand for heat from non-UFH zones then turn on pump 
       if ((anyZoneDemand & (ZONE_DINING | ZONE_STUDY))) turnRelay(PRI_CIRCUIT_PUMP, ON);
-/*       && (tempC[BOILER] > PUMP_THRESHOLD)
-        && (!(anyZoneDemand & ZONE_DHW) || (tempC[DHW_TANK] > DHW_THRESHOLD_TEMP))) turnRelay(PRI_CIRCUIT_PUMP, ON); */
       else turnRelay(PRI_CIRCUIT_PUMP, OFF);
       break;
       
@@ -578,9 +556,8 @@ void controlUFHPump(){
         return;
       }
       
-      // If demand for heat, then check if boiler & DHW (if demanded) up to temp before taking heat
+      // If demand for heat from UFH zones then turn on pump
       if (anyZoneDemand & (ZONE_GT_HALL | ZONE_KITCHEN | ZONE_BASEMENT)) turnRelay(UFH_PUMP, ON);
-//        && (!(anyZoneDemand & ZONE_DHW) || (tempC[DHW_TANK] > DHW_THRESHOLD_TEMP))) turnRelay(UFH_PUMP, ON);  // No longer needed
       else turnRelay(UFH_PUMP, OFF);
       break;
 
@@ -685,48 +662,6 @@ void controlMixer() {                                // Adjusts the mixer valve 
   }
 }
 
-/*  No longer needed
-void checkDHWStatus() {
-
-	switch (systemMode) {
-
-	case STARTUP:        // No action
-		turnRelay(DHW_PRIMARY_PUMP, OFF);
-		startupPending &= ~_BV(DHW_PRIMARY_PUMP);          // Clear startup flag
-		break;
-
-	case RUNNING:
-
-		turnRelay(DHW_PRIMARY_PUMP, 
-			(!fault(DHW_TANK)          // Check nothing wrong
-			&& (anyZoneDemand & ZONE_DHW)              // Check there is heat demand
-			&& (tempC[DHW_TANK] < tempC[BOILER]))      // Check boiler is warmer than cylinder
-			? ON : OFF);
-		break;
-
-	case QUIESING:
-		turnRelay(DHW_PRIMARY_PUMP, ON);      // Dump heat to cylinder
-		break;
-
-	case ERROR:
-		turnRelay(DHW_PRIMARY_PUMP, (tempC[BOILER] > BOILER_RUN_ON_TEMP) ? ON : OFF);
-		break;
-		
-	case DORMANT:
-		turnRelay(DHW_PRIMARY_PUMP, OFF);
-		break;
-
-	case MANUAL:
-		turnRelay(DHW_PRIMARY_PUMP, (manualState & _BV(DHW_PRIMARY_PUMP)) ? ON : OFF);
-		break;
-	}
-
-	// Set psuedo zone demand for DHW.  This can result in setSystemMode() changing mode from DORMANT to RUNNING
-	if (onPeriodH && (tempC[DHW_TANK] + TOLERANCE) < dhwMaxTemp) anyZoneDemand |= ZONE_DHW;             // Call for heat
-	else anyZoneDemand &= ~ZONE_DHW;            // Turn off call for heat  
-}
-*/
-
 void controlRecirc() {
   
   switch (systemMode) {
@@ -753,7 +688,7 @@ void controlRecirc() {
   }
 }
 
-void initSensorD(byte sensorNum, byte pin) {
+void initTempSensor(byte sensorNum, byte pin) {
   
   oneWire[sensorNum].init(pin);
   delay(10);
@@ -823,7 +758,7 @@ byte readPrecision(byte sensorNum) {
   return 0;
 }
 
-float getTempD(byte sensorNum) {
+float getTempC(byte sensorNum) {
 
   unsigned int tConv;
   
@@ -973,46 +908,40 @@ void updateStatus() {
     switch (row) { 
       case ROW_0:
         for (int i = 0; i < NUM_ZONES; i++) BUF_ADD "%c", (anyZoneDemand & _BV(i)) ? zoneTag[i] : zoneTag[i] + 32);   
-        BUF_ADD "%c", ' ');
+        BUF_ADD " ");
         for (int i = 0; i < NUM_DHW; i++) BUF_ADD "%c", (anyDHWDemand & _BV(i)) ? DHWTag[i] : DHWTag[i] + 32); 
  
-		BUF_ADD " ");
-		bufPosn += putRelayStatus(DHW_RECIRC_PUMP, row, bufPosn);
+		    BUF_ADD " ");
+		    bufPosn += putRelayStatus(DHW_RECIRC_PUMP, row, bufPosn);
 
-		if (relayOn(DHW_RECIRC_PUMP)) {
-			bufPosn += snprintf(statusMap[row] + bufPosn, NUM_COLS - bufPosn, " %d", (DHW_TIMEOUT - (heartBeatSecs - recircStart)) / 60);
-		}
-		else bufPosn += snprintf(statusMap[row] + bufPosn, NUM_COLS - bufPosn, "%2c", ' ');
+		    if (relayOn(DHW_RECIRC_PUMP)) {
+			    bufPosn += snprintf(statusMap[row] + bufPosn, NUM_COLS - bufPosn, " %d", (DHW_TIMEOUT - (heartBeatSecs - recircStart)) / 60);
+		    }
+		    else bufPosn += snprintf(statusMap[row] + bufPosn, NUM_COLS - bufPosn, "%2c", ' ');
         break;
 
       case ROW_1:
         bufPosn += putRelayStatus(BURNER, row, bufPosn);
-        bufPosn += putTemp(BOILER, row, bufPosn);
-		BUF_ADD "%c", '/');
-		bufPosn += putTemp(PRI_RETURN, row, bufPosn);
-
-		BUF_ADD " ");
-        bufPosn += putRelayStatus(DHW_PRIMARY_PUMP, row, bufPosn);
         bufPosn += putTemp(DHW_TANK, row, bufPosn);
-        
-		BUF_ADD " ");
-        bufPosn += putRelayStatus(PRI_CIRCUIT_PUMP, row, bufPosn);
+        BUF_ADD " ");
 
-		BUF_ADD " %d.%d", centibars / 100, centibars % 100);
+        bufPosn += putRelayStatus(PRI_CIRCUIT_PUMP, row, bufPosn);
+        bufPosn += putTemp(BOILER, row, bufPosn);
+		    BUF_ADD "/");
+		    bufPosn += putTemp(PRI_RETURN, row, bufPosn);
+        BUF_ADD " ");
+        
+        bufPosn += putRelayStatus(UFH_PUMP, row, bufPosn);
+        bufPosn += putTemp(UFH_FLOW, row, bufPosn);
+        BUF_ADD "/");
+        bufPosn += putTemp(UFH_RETURN, row, bufPosn);
         break;
         
       case ROW_2:
-        bufPosn += putRelayStatus(UFH_PUMP, row, bufPosn);
-        bufPosn += putTemp(UFH_FLOW, row, bufPosn);
-        BUF_ADD "%c", '/');
-        bufPosn += putTemp(UFH_RETURN, row, bufPosn);
+        BUF_ADD "%d.%d bar ", centibars / 100, centibars % 100);
         
-        BUF_ADD " "); 
         bufPosn += putRelayStatus(MIXER_OPEN, row, bufPosn);   
         bufPosn += putRelayStatus(MIXER_CLOSE, row, bufPosn); 
-		
-		BUF_ADD " %c", (anyZoneDemand & UFH_ZONES) ? timePatternTag[0] : timePatternTag[0] + 32);
-		BUF_ADD "%c", (anyZoneDemand & ZONE_DHW) ? timePatternTag[1] : timePatternTag[1] + 32);
         break;
 
       case ROW_3: 
@@ -1062,30 +991,47 @@ void displayStatus() {
 }
 
 
-// ***** TWI input data *****
-// Event handle established in Setup
-//
-// Messages processed as follows:
-//	 Bm		- boiler pressure (centibars)
-//   Dzf    - DHW demand for heat - zone z either on (f == '1') or off (f != '1')
-//   Mmf    - manual mode - direct control.  On (f == '1') or Off (f != '1')
-//   Of     - ON period (n == 1) or OFF period (n != 1) for DHW
-//	 Puh	- current programmes for UFH and hot water
-//   Ssn    - select type of data to send, s: D = DHW demand, R = Relay, S = Status (n = row), T = Temperature, Z = Zone demand
-//   Zzf    - Zone demand for heat - zone z either on (f == '1') or off (f != '1')
-//
-void receiveData(int howMany) {
+// ***** TWI ISR *****
 
-	if (Wire.available()) {
+void processOnReceive(int length) {
+    // ISR to flag receipt of data from Basement controller - handle established in Setup
+    // Real work then done by processIncomingI2C
+    incomingI2C = true;           // Set flag
+    incomingSize = length;         // Checked against data received
+}
+
+
+void processIncomingI2C() {
+
+/*  Process incoming I2C messages, and respond with data if needed
+
+    Messages processed as follows:
+	      Bm		  - boiler pressure (centibars) - info
+        Dzf    - DHW demand for heat - zone z either on (f == '1') or off (f != '1') - action needed
+        Mmf    - manual mode - direct control.  On (f == '1') or Off (f != '1') - action needed
+        Ssn    - status request.  s: D = DHW demand, R = Relay, S = Status (n = row), T = Temperature, Z = Zone demand - response needed
+        T      - time - info
+        Zzf    - Zone demand for heat - zone z either on (f == '1') or off (f != '1') - action needed
+
+    All messages trigger a response to Basement controller, either "OK" or real data
+*/
+
+  incomingI2C = false;           // Reset flag
+  int _incomingSize;
+
+	if (_incomingSize = Wire.available()) {
     
     char mode = Wire.read(); 
-    char command = Wire.read(); 
+    char command = Wire.read();
+    char subCommand = Wire.read();      // Redundant for mode == 'B'
     byte switchVal = 0;
+    char OK[] = "OK";
     
     switch (mode) {
-		case 'B':
-			centibars = command;
-			break;
+		    case 'B':
+			    centibars = command;
+          basementI2C(OK, 2);
+			    break;
 
       case 'D':              // DHW demand - 1 == yes, 0 == no
         switch (command) {
@@ -1095,10 +1041,11 @@ void receiveData(int howMany) {
           case 'U':      switchVal = DHW_UPPER; break;
           case 'E':      switchVal = DHW_ENSUITE; break;
         }     
-        (Wire.read() == '1') ? anyDHWDemand |= switchVal : anyDHWDemand &= ~switchVal;
+        (subCommand == '1') ? anyDHWDemand |= switchVal : anyDHWDemand &= ~switchVal;
         
         for (int i = 0; i < NUM_DHW; i++) if ((anyDHWDemand & _BV(i)) & ~(prevAnyDHWDemand & _BV(i))) newDHWDemand = true;
         prevAnyDHWDemand = anyDHWDemand;
+        basementI2C(OK, 2);
         break;
         
       case 'M':                // Manual mode.  Exit either when cleared or after MANUAL_TIMEOUT_MINS
@@ -1114,7 +1061,7 @@ void receiveData(int howMany) {
           case 'R':      switchVal = DHW_RECIRC_PUMP; break;
         }
         
-        if (Wire.read() == '1') {
+        if (subCommand == '1') {
           // Make sure we only open the mixer in one direction
           if (switchVal == MIXER_OPEN) manualState &= ~_BV(MIXER_CLOSE);
           if (switchVal == MIXER_CLOSE) manualState &= ~_BV(MIXER_OPEN);
@@ -1126,64 +1073,48 @@ void receiveData(int howMany) {
         
         systemMode = MANUAL;
         minsInMode = 0;
-
+        basementI2C(OK, 2);
         break;
-
-	  case 'O':
-		  onPeriodH = (command == '1');
-		  break;
-
-		case 'P':
-			timePatternTag[0] = command;
-			timePatternTag[1] = Wire.read();
-			break;
         
       case 'S':                               // Used by zone_control_basement to select data required
-        statusSelect = command;
-        displaySelect = Wire.read();
+        processStatusRequest(command, (int)(subCommand - 48));           // Convert from ASCII to int
         break; 
 
       case 'T':                                // Time in dhm format
-        timeNow = (unsigned int)command << 8 | Wire.read();
-		timeReceived = TRUE;		// Keeps watchdog happy
-                
-        // Once a week, set DHW temp higher to counter Legionella
-        dhwMaxTemp = (dhmGet(timeNow, VAL_DAY) == 2) ? DHW_HIGH_TEMP : DHW_NORM_TEMP;    // Monday is day 2 (can be any day, but avoid weekends when more water consumption)
-     
+        timeNow = (unsigned int)command << 8 | subCommand;
+        basementI2C(OK, 2);
         break;
         
       case 'Z':              // Zone heat demand - yes/no
-		switch (command) {
-			case 'K': switchVal = ZONE_KITCHEN; break;
-			case 'G': switchVal = ZONE_GT_HALL; break;
-			case 'B': switchVal = ZONE_BASEMENT; break;
-			case 'D': switchVal = ZONE_DINING; break;
-			case 'S': switchVal = ZONE_STUDY; break;
-			default:  switchVal = 0; break;
-		}
-		(Wire.read() == '1') ? anyZoneDemand |= switchVal : anyZoneDemand &= ~switchVal;
+		    switch (command) {
+			    case 'K': switchVal = ZONE_KITCHEN; break;
+			    case 'G': switchVal = ZONE_GT_HALL; break;
+			    case 'B': switchVal = ZONE_BASEMENT; break;
+			    case 'D': switchVal = ZONE_DINING; break;
+			    case 'S': switchVal = ZONE_STUDY; break;
+			    default:  switchVal = 0; break;
+		    }
+		    (subCommand == '1') ? anyZoneDemand |= switchVal : anyZoneDemand &= ~switchVal;
 
+        basementI2C(OK, 2);
         break;
     }    
   }
 }
 
-// ******** TWI output data - report status to Wire interface *********
-// Called to get response to 'Ssn' request, where statusSelect set to 's' and displaySelect set to 'n' in receiveData
-// Event handle established in Setup
-//
 
-void reportStatus() {
+void processStatusRequest(char statusSelect, int displaySelect) {
 
-	const byte BUFLEN = 128;        // Align to UDP_TX_PACKET_MAX_SIZE in EthernetUdp.h and BUFFER_LENGTH in Wire.h
-	char buffer[BUFLEN];
-	byte bufPosn = 0;
-	#define BUF_ADD bufPosn += snprintf(buffer + bufPosn, BUFLEN - bufPosn,
+  // Process response to status requests ('Ssn')
+    
+	char buffer[TWI_BUFFER_SIZE];
+	int bufPosn = 0;
+	#define BUF_ADD bufPosn += snprintf(buffer + bufPosn, TWI_BUFFER_SIZE - bufPosn,
 
 	byte limit;
-
+  
 	switch (statusSelect) {
-		case 'D':
+		case 'D':                   // DHW demand for recirc
 			limit = NUM_DHW - 1;
 
 			BUF_ADD "{\"DA\":\"%c%c\",", meInit, statusSelect);
@@ -1192,12 +1123,13 @@ void reportStatus() {
 			}
 			BUF_ADD "\"T\":\"%d\"}\0", relayOn(DHW_RECIRC_PUMP) ? (DHW_TIMEOUT - (heartBeatSecs - recircStart)) / 60 : 0);
 			break;
-
-		case 'M':
-			BUF_ADD "{\"DA\":\"%c%c\",\"%c\":\"%c\"}\0", meInit, statusSelect, statusSelect, modeTag[systemMode]);
-			break;
-
-		case 'R':
+/*
+    case 'E':                   // Error reported when attempting to read data from Basement controller
+      BUF_ADD "{\"DA\":\"%cX\",\"%c\":\"No data received\"}\0", meInit, statusSelect);
+      break;
+*/
+  
+		case 'R':                   // Relay/pump status
 			limit = NUM_RELAYS - 1;
 
 			BUF_ADD "{\"DA\":\"%c%c\",", meInit, statusSelect);
@@ -1207,12 +1139,12 @@ void reportStatus() {
 			}
 			break;
 
-		case 'S':
+		case 'S':                   // Status display, line 'displaySelect'
 			for (int i = 0; i < NUM_COLS; i++) buffer[i] = statusMap[displaySelect][i];
 			bufPosn = NUM_COLS + 1;
 			break;
 
-		case 'T':
+		case 'T':                   // Current temperatures
 			limit = NUM_SENSORS - 1;
 
 			BUF_ADD "{\"DA\":\"%c%c\",", meInit, statusSelect);
@@ -1223,7 +1155,7 @@ void reportStatus() {
 			}
 			break;
 
-		case 'Z':
+		case 'Z':                   // Target temperatures
 			limit = NUM_ZONES - 1;
 
 			BUF_ADD "{\"DA\":\"%c%c\",", meInit, statusSelect);
@@ -1233,11 +1165,26 @@ void reportStatus() {
 			}
 			break;
 
-		default:					// Error condition - no/bad data received on previous receiveData
-			BUF_ADD "{\"DA\":\"%cX\",\"%c\":\"Bad request\"}\0", meInit, statusSelect);
+		default:					// Error condition - bad data received on previous receiveData
+			BUF_ADD "{\"DA\":\"%cX\",\"%c%x\":\"Bad request\"}\0", meInit, statusSelect, statusSelect);
 			break;
 	}
 
-	// Reply with data
-	Wire.write((byte*)buffer, bufPosn + 1);			// Not sure why need the extra char, but seems to be needed
+  basementI2C(buffer, bufPosn);  
+}
+
+unsigned int basementI2C(char* sendBuffer, int sendBuflen) {     
+    
+    // Handle comms with basement over I2C
+
+    // Setup I2C bus as Master
+    Wire.begin();
+
+    // Send the data
+    Wire.beginTransmission(I2C_ADDR_BASEMENT);
+    Wire.write(sendBuffer, sendBuflen);
+    Wire.endTransmission();
+
+    // Swap this controller back to be slave
+    Wire.begin(I2C_ADDR_BOILER);
 }
