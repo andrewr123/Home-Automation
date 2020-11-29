@@ -1,4 +1,6 @@
-/* Zone control for Gt Hall
+/* 
+ZONE CONTROLLER FOR GREAT HALL
+------------------------------
 
 Version history
 ---------------
@@ -8,17 +10,17 @@ Nov 20 - v2 - upgraded to field queries and send messages to boiler
 
 */
 
+#define UDP_TX_PACKET_MAX_SIZE 128			// Per override in OneDrive\Documents\Arduino\Libraries\Ethernet\EthernetUDP.h
+
 #include <avr/wdt.h>
 #include <SPI.h>
 #include "Ethernet.h"
-#define UDP_TX_PACKET_MAX_SIZE 128			// Override the default 24
 #include <EthernetUdp.h>
 
 #include "HA_globals.h"
 #include "HA_syslog.h"         // For syslog comms
 #include "HA_queue.h"          // Needed to support syslog
 #include "HA_comms.h"          // For general UDP comms
-#include <Wire.h>
 
 #include "HA_time.h"
 #include "Time.h"
@@ -27,17 +29,14 @@ Nov 20 - v2 - upgraded to field queries and send messages to boiler
 #include "TimerOne.h"
 
 
+// SPECIFIC ELEMENTS - FOR THIS CONTROLLER
 
 // ****** Identity of this controller ******
 
 #define meIP GtHallIP              // 192.168.7.181
 #define meMac GtHallMac
-char meName[]									= "GtHall";
-const static char meInit			= 'G';
-
-// ***** External comms *****
-
-char syslogLevel = 'W';				// Available flags - XACEWNID
+char meName[] = "GtHall";
+const static char meInit = 'G';
 
 // ******  Window sensors  *****
 
@@ -50,34 +49,41 @@ const static byte ZONE_GREAT_HALL = 0;
 const char sensorTag[] = { 'G' };
 const static byte NUM_SENSORS = 1;
 const static byte GREAT_HALL_MANIFOLD = 1;
-const static byte NUM_ZONES = NUM_SENSORS + 1;	
+const static byte NUM_ZONES = NUM_SENSORS + 1;
 
-// Time patterns define whether zone is ON or OFF
+// GENERIC ELEMENTS - COMMON TO ALL CONTROLLERS
 
-const byte NUM_TIME_PATTERNS = 4;          // Number of different time patterns permitted
-const byte ALLDAY = 0;								// 6am - 11pm
-const byte BACKGROUND = 1;							// Cycling through the day
-const byte AFTERNOON = 2;							// Post noon
-const byte TURNOFF = 3;	 							// Turn off
-const char timePatternTag[] = { 'A', 'B', 'N', 'X' };
+// ***** External comms *****
 
-byte timePattern[NUM_ZONES] = { BACKGROUND, BACKGROUND };		// Set the time patterns for each zone - Gg
+char syslogLevel = 'W';				// Available flags - XACEWNID
 
-const byte MAX_TIME_PERIODS = 5;           // Number of ON periods allowed per day per time pattern
+// ******  Time and time patterns ******
 
-// ******  Time ******
 // Current time is updated every 30 secs ...
 
 unsigned int timeNow = 0;
 
 // ... and compared against time patterns ...
+const byte NUM_TIME_PATTERNS = 4;          // Number of different time patterns permitted
+const byte MAX_TIME_PERIODS = 5;           // Number of ON periods allowed per day per time pattern
 unsigned int timePeriodStart[NUM_ZONES][NUM_TIME_PATTERNS][MAX_TIME_PERIODS];        // Start of time period
 unsigned int timePeriodEnd[NUM_ZONES][NUM_TIME_PATTERNS][MAX_TIME_PERIODS];          // End of time period
 byte numTimePeriods[NUM_ZONES][NUM_TIME_PATTERNS];
 
-// ... and set flag for zone accordingly to determine if zone on or off
+// Time patterns define whether zone is ON or OFF
+
+const byte ALLDAY = 0;								// 6am - 11pm
+const byte BACKGROUND = 1;						// Cycling through the day
+const byte AFTERNOON = 2;							// Post noon
+const byte TURNOFF = 3;	 							// Turn off
+const char timePatternTag[] = { 'A', 'B', 'N', 'X' };
+
+// ... and comparison with timeNow sets flag to determine if zone on or off
 
 boolean onPeriod[NUM_ZONES];                            // Set by time vs programme.  If ON then active; if OFF then go to stanbdy
+
+// Set default time patterns
+byte timePattern[NUM_ZONES] = { BACKGROUND, BACKGROUND };		// Set the time patterns for each zone - Gg
 
 // ******   Internal (relative) timing  *******
 
@@ -88,7 +94,9 @@ const unsigned int CHECK_INPUT_FREQ					= 1;			// Check if any messages from con
 const unsigned int CHECK_WINDOWS_FREQ       = 5;			// Check window sensors every 5 secs
 const unsigned int CHECK_MANIFOLD_FREQ = 5;						// Check if manifolds need heat and alert boiler
 const unsigned int CHECK_TIME_FREQ = 30;							// Work out current time every 30 secs and act on it
-const unsigned int REPORT_STATUS_FREQ = 10;						// Status log to syslog
+
+// PRE-BOOT CODE
+// -------------
 
 // **** Megacore code to preserve internal registers to determine restart reason ****
 /*
@@ -123,12 +131,6 @@ void setup() {
   MCUSR = 0;
   wdt_disable();
 
-	// Startup actions
-	/*
-	Serial.begin(9600);
-	Serial.println("Starting");
-	*/
-
 	setupComms();
 	logStartupReason();
 	setupTimePeriods();
@@ -147,6 +149,9 @@ void loop() {
   // Reset watchdog - if fault then this won't happen and watchdog will fire, restarting the sketch
   wdt_reset();
 
+	// Run any background daemons - needed to support HA_time.cpp
+	wakeup.runAnyPending();
+
   // Increment heartbeat every second 
   if ((millis() - prevTime) >= HEARTBEAT_FREQ_MS) {   
 
@@ -163,7 +168,7 @@ void loop() {
     if (heartBeatSecs % CHECK_WINDOWS_FREQ == 0) checkWindows();
 
 		// See if manifolds want more heat - tell boiler
-		if (heartBeatSecs % CHECK_MANIFOLD_FREQ == 0) checkManifolds();
+		if (heartBeatSecs % CHECK_MANIFOLD_FREQ == 0) checkManifold();
 
   }
   
@@ -171,8 +176,6 @@ void loop() {
 }
 
 void setupComms() {
-
-		char logMsg[UDP_TX_PACKET_MAX_SIZE];
 
 		/*
 			  Disable the SD CS to avoid interference with UDP transmission - http://arduino.cc/forum/index.php?action=printpage;topic=96651.0
@@ -217,7 +220,6 @@ void setupComms() {
 
 		// Get the time from NTP server
 		initialiseTime(UdpNTPPort);
-		timeToText(now(), logMsg, UDP_TX_PACKET_MAX_SIZE);           // Get current time
 }
 
 void logStartupReason() {
@@ -225,7 +227,8 @@ void logStartupReason() {
 		// Log reason for startup to SYSLOG by testing resetFlag made available on startup - see Megacore refs above
 
 		int myMCUSR;    // Startup reason
-		char logMsg[UDP_TX_PACKET_MAX_SIZE];  
+		char logMsg[UDP_TX_PACKET_MAX_SIZE];
+		timeToText(now(), logMsg, UDP_TX_PACKET_MAX_SIZE);           // Get current time
 
 		// Order of tests is significant; last succesful test is what's reported
 		if (resetFlag & (1 << WDRF)) myMCUSR = WDRF;				// Watchdog reset
@@ -361,6 +364,7 @@ void checkForInput() {
 
 				if (numMsgs++ > MAX_MSGS) {
 						SENDLOGM('W', "Max msgs exceeded");
+						RESTORE_CONTEXT
 						return;
 				}
 
@@ -391,9 +395,9 @@ void checkForInput() {
 
 						break;
 
-				case 'S':        // Status request - just a ping at present to test syslogstatus
+				case 'S':        // Status request - just a ping at present to test time pattern
 
-						BUF_ADD "{\"DA\":\"%c%c\",", meInit, syslogLevel);
+						BUF_ADD "{\"DA\":\"%c%c\",", meInit, timePatternTag[timePattern[GREAT_HALL_MANIFOLD]]);
 						BUF_ADD "}\0");
 						
 						// Reply to requestor
@@ -414,10 +418,10 @@ void checkForInput() {
 		RESTORE_CONTEXT
 }
 
-void checkManifolds() {      // See if manifolds want more heat - tell boiler
+void checkManifold() {      // See if manifolds want more heat - tell boiler
 		char message[] = "ZG ";
 
-		// Great Hall just determine by timePeriod pending sensor input
+		// Great Hall - just determine by timePeriod pending sensor input
 		message[2] = (onPeriod[GREAT_HALL_MANIFOLD]) ? '1' : '0';
 		ard.put(basementIP, UdpArdPort, message, 3);
 }

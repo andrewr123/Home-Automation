@@ -17,10 +17,9 @@ Nov 18 - v5 - new boiler - remove boiler or DHW temperature monitoring
 Jun 20 - v6 - improve error handling on comms loss - re-start comms
 Nov 20 - v7 - adopt interrupt-driven usage of I2C comms, alternating master/slave relationship to provide duplex comms
               (equivalent changes in Basement controller)
-            - re-engineer to split request/read steps in sensor processing to reduce delays - uses 'wakeup'
-            - move temperature sensor code to HA_temperature library
+Nov 20 - v8 - re-engineer to split request/read steps in sensor processing to reduce delays - uses 'wakeup'
 
-To do: provide 5v supply to sensors through dedicated pins, allowing hard reset; implement watchdog - use Optiboot bootloader 
+To do: provide 5v supply to sensors through dedicated pins, allowing hard reset
 
 
 Uses TWI/I2C interface to communicate with the outside world.  Avoids the need for an Ethernet shield on what is a crowded board
@@ -106,11 +105,9 @@ A4 & A5 - TWI
 
 */
 
-#define TWI_BUFFER_SIZE 96		// Per override in AppData\Local\Arduino15\packages\arduino\hardware\avr\1.8.3\libraries\Wire\src\wire.h & \utilities\twi.
-#define NUM_SENSORS 5         // For the moment, align to HA_temperature
+#define TWI_BUFFER_SIZE 96		// Per override in AppData\Local\Arduino15\packages\arduino\hardware\avr\1.8.3\libraries\Wire\src\wire.h & \utilities\twi.h
 
-#include <arduino.h>
-#include <avr/wdt.h>
+
 #include <LiquidCrystal.h>
 #include "Wakeup.h"
 #include "TimerOne.h"            // NB: modified version of public TimerOne library
@@ -118,7 +115,6 @@ A4 & A5 - TWI
 #include <Wire.h>
 #include "Bitstring.h"
 
-#include "HA_temperature.h"
 #include "HA_globals.h"
 
 
@@ -132,32 +128,44 @@ volatile boolean incomingI2C;
 volatile int incomingSize;
 #define I2C_ADDR_BOILER 2
 #define I2C_ADDR_BASEMENT 1
-
-// ****** Temperature sensor objects *******
-
-HA_temperature sensor[NUM_SENSORS];
   
 // *************  Temperature sensors - Dallas DS18B20  ***********
 
-//extern const byte NUM_SENSORS;      // Defined in HA_temperature
-
-const static byte PRI_FLOW          = 0;
+const static byte PRI_FLOW          = 0;			   
 const static byte UFH_FLOW          = 1;      
 const static byte UFH_RETURN        = 2;      
 const static byte BOILER            = 3; 				  
 const static byte PRI_RETURN        = 4;
 const char sensorTag[] = { 'B', 'U', 'u', 'D', 'T'};
+const static byte NUM_SENSORS       = 5;
 
-const static byte TARGET_PRECISION  = 10;                   // Equates to 0.25C - good enough
-
-// Digital sensor pins on Uno
-const static byte SENSOR_PIN[NUM_SENSORS] = { 2, 3, 4, 5, 6 };
-
-// ****** Control flags ******
+  
+const static int MIN_TEMP           = 1;            // Minimum credible temperature - less than this suggests sensor is faulty (or house very cold)
+const static int MAX_TEMP           = 95;           // Max allowable temp for sensors
+const static int ERR_TEMP           = 99;           // To indicate error reading
 
 byte somethingWrong                 = 0;            // If BV == 1, then display flag (and shutdown if critical)
 const static byte NUM_FAULT_FLAGS   = NUM_SENSORS;
 const char faultTag[NUM_FAULT_FLAGS] = { 'P', 'U', 'u', 'B', 'p' };
+
+// Sensor pins
+const static byte SENSOR_PIN[NUM_SENSORS] = {2, 3, 4, 5, 6};
+
+// Sensor flags
+const static byte PRIMARY_SENSORS   = B00010001;
+const static byte UFH_SENSORS       = B00000110;
+const static byte BOILER_SENSOR     = B00001000;
+const static byte ALL_SENSORS       = 0xff;
+
+// OneWire instances to communicate with any OneWire devices 
+OneWire oneWire[NUM_SENSORS];
+const static byte TEMPERATURE_PRECISION = 10;                   // Equates to 0.25C - good enough
+
+// Sensor data
+byte romFamily[NUM_SENSORS];                                    // Holds the ROM family extracted from buffer
+volatile float tempC[NUM_SENSORS] = { 99 };                     // Holds the latest temperature from the sensor - can be updated via ISR, hence volatile
+volatile boolean sensorInUse[NUM_SENSORS] = { false };          // To allow co-operative access to sensor bus
+volatile unsigned int wakeupErrorCount = 0;
 
 // *****************  On/off relays  ********************
 
@@ -171,7 +179,6 @@ const static byte DHW_RECIRC_PUMP    = 6;
 const static byte INTERNET           = 7;          // Not used
 const char relayTag[] = { 'B', 'O', 'C', 'D', 'U', 'P', 'R', 'I'};
 const static byte NUM_RELAYS         = 8;
-byte startupPending = 0;            // Flags cleared as each relay goes through startup
   
 // Relay ports on 595
 const static byte RELAY_PORT[NUM_RELAYS] = {0, 7, 6, 5, 4, 3, 2, 1};
@@ -231,9 +238,54 @@ float dhwMaxTemp                           = DHW_NORM_TEMP;  // Max temp allowed
 boolean onPeriodH						               = FALSE;			// Used to flag that DHW is ON or OFF
 
 // ******* Boiler pressure ******
-
 byte centibars								= 0;			// Boiler primary circuit water pressure
 const static byte MIN_PRESSURE = 10;		// 0.1 bar
+
+// *************  Startup flags  ***********
+
+byte startupPending                        = 0;            // Flags cleared as each relay goes through startup
+// byte timeReceived						               = FALSE;		   // Supports watchdog action on comms with outside world
+
+// ***********  Adapted version of DALLAS LIB VERSION "3.7.2"   ************
+
+// Model IDs
+const static byte DS18S20 = 0x10;
+const static byte DS18B20 = 0x28;
+const static byte DS1822  = 0x22;
+		
+// OneWire commands
+const static byte STARTCONVO 	    = 0x44;  // Tells device to take a temperature reading and put it on the scratchpad
+const static byte COPYSCRATCH     = 0x48;  // Copy EEPROM
+const static byte READSCRATCH     = 0xBE;  // Read EEPROM
+const static byte WRITESCRATCH    = 0x4E;  // Write to EEPROM
+		
+// ROM locations
+const static byte ROM_FAMILY	  = 0;
+const static byte ROM_CRC	  = 7;
+		
+// Scratchpad locations
+const static byte TEMP_LSB        = 0;
+const static byte TEMP_MSB        = 1;
+const static byte HIGH_ALARM_TEMP = 2;
+const static byte LOW_ALARM_TEMP  = 3;
+const static byte CONFIGURATION   = 4;
+const static byte INTERNAL_BYTE   = 5;
+const static byte COUNT_REMAIN    = 6;  
+const static byte COUNT_PER_C     = 7;
+const static byte SCRATCHPAD_CRC  = 8;
+		
+// Device resolution
+const static byte TEMP_9_BIT  = 0x1F; //  9 bit
+const static byte TEMP_10_BIT = 0x3F; // 10 bit
+const static byte TEMP_11_BIT = 0x5F; // 11 bit
+const static byte TEMP_12_BIT = 0x7F; // 12 bit
+		
+// Conversion time - see data sheets
+const static int T_CONV_9_BIT    = 200; //94;  
+const static int T_CONV_10_BIT   = 300; //188; 
+const static int T_CONV_11_BIT   = 450; // 375;  
+const static int T_CONV_12_BIT   = 750;  
+const static int T_CONV_DS18S20  = 750;
 
 // ******   Timing   *******
 //
@@ -249,7 +301,6 @@ const unsigned int DHW_DEMAND_CHECK_FREQ     = 5;        // Check if DHW demand
 const unsigned int ROUTER_RESTART_CHECK_FREQ = 10;
 const unsigned int ONE_MINUTE                = 60;
 const unsigned int MANUAL_TIMEOUT_MINS       = 10;        // Minutes allowed in MANUAL; then set to RUNNING
-const byte CHECK_FREQ[NUM_SENSORS] = { UFH_TEMP_CHECK_FREQ, TEMP_CHECK_FREQ, TEMP_CHECK_FREQ, TEMP_CHECK_FREQ, UFH_TEMP_CHECK_FREQ };
 
 
 // ****************  LCD display  ***************************
@@ -268,6 +319,12 @@ const static byte NUM_COLS                   = 20;          // In practice, only
 const static byte NUM_ROWS                   = 4;
 char statusMap[NUM_ROWS][NUM_COLS + 1];
 BITSTRING statusChanged(NUM_ROWS * NUM_COLS);        // BV == 1 indicates status has changed since last displayed
+
+// ****** Error reporting ******
+
+//const static byte ERR_LIMIT = 16;
+//byte errorLog[ERR_LIMIT];                           // Up to 16 hex codes stored
+//unsigned int numErrors = 0;                         // Total count is available
 
 // ******  Time - updated every 30 secs in dhm format
 
@@ -288,50 +345,13 @@ eSystemMode systemMode;
 const char modeTag[] = { 'S', 'E', 'R', 'Q', 'D', 'M' };
 
 
-// **** Code to preserve internal registers to determine restart reason ****
-/*
-   Code added from https://github.com/Optiboot/optiboot/blob/master/optiboot/examples/test_reset/test_reset.ino
-
-   First, we need a variable to hold the reset cause that can be written before early sketch initialization
-   (which might change r2), and won't be reset by the various initialization code.
-   avr-gcc provides for this via the ".noinit" section.
-*/
-uint8_t resetFlag __attribute__((section(".noinit")));
-
-/*
-   Next, we need to put some code to save reset cause from the bootload (in r2) to the variable. Again, avr-gcc
-   provides special code sections for this.  If compiled with link time optimization (-flto), as done by the
-   Arduno IDE version 1.6 and higher, we need the "used" attribute to prevent this from being omitted.
-*/
-void resetFlagsInit(void) __attribute__((naked))
-__attribute__((used))
-__attribute__((section(".init0")));
-void resetFlagsInit(void)
-{
-    /*
-       save the reset flags passed from the bootloader.  This is a "simple" matter of storing (STS) r2 in the
-       special variable that we have created.  We use assembler to access the right variable.
-    */
-    __asm__ __volatile__("sts %0, r2\n" : "=m" (resetFlag) : );
-}
-
-
 void setup(void) {
-    
-    // Reset watchdog
-
-    MCUSR = 0;
-    wdt_disable();
-    wdt_enable(WDTO_8S);
 
     // Startup actions
-    logStartupReason();
     setupComms();
     setupSensors();
     setupRelays();
-
     setupLCD();
-
 
     // Go into startup mode
     systemMode = STARTUP;
@@ -345,86 +365,48 @@ void setup(void) {
 
 void loop(void) { 
 
-    // Reset watchdog - if fault then this won't happen and watchdog will fire, restarting the sketch
-    wdt_reset();
-
     // Increment heartbeat every second 
     if ((millis() - prevTime) >= HEARTBEAT_FREQ_MS) {   
     
-        prevTime = prevTime + HEARTBEAT_FREQ_MS;                  // Avoid normal = millis() to allow catchup
-        heartBeatSecs++;                                          // Eventual overflow @ 64k not material
+    prevTime = prevTime + HEARTBEAT_FREQ_MS;                  // Avoid normal = millis() to allow catchup
+    heartBeatSecs++;                                          // Eventual overflow @ 64k not material
 
-        if (heartBeatSecs % ONE_MINUTE == 0) minsInMode++;
+    if (heartBeatSecs % ONE_MINUTE == 0) {
+        minsInMode++;
+    }
 
-        if (heartBeatSecs % DHW_DEMAND_CHECK_FREQ == 0) controlRecirc();       // If DHW demand then turn on recirc pump & start countdown timer
+    if (heartBeatSecs % DHW_DEMAND_CHECK_FREQ == 0) controlRecirc();       // If DHW demand then turn on recirc pump & start countdown timer
     
-        if (heartBeatSecs % UFH_TEMP_CHECK_FREQ == 0) {
-            
-            // Get latest temperatures - constantly refreshed in background
-            sensor[UFH_FLOW].getTempC();  
-            sensor[UFH_RETURN].getTempC();
-
-            // Check status of mixer and adjust to hit target output temperature
-            controlMixer();        
-        }
+    if (heartBeatSecs % UFH_TEMP_CHECK_FREQ == 0) controlMixer();        // Runs more frequently than main temp check loop to avoid over/under shoot on mixer valve
         
-        if (heartBeatSecs % TEMP_CHECK_FREQ == 0) {                         // Main loop - relatively infrequent as temps don't change too rapidly
-
-             // Get latest temperatures - constantly refreshed in background
-            sensor[BOILER].getTempC();
-            sensor[PRI_FLOW].getTempC();
-            sensor[PRI_RETURN].getTempC();
+    if (heartBeatSecs % TEMP_CHECK_FREQ == 0) {               // Main loop - relatively infrequent as temps don't change too rapidly
  
-            // Set boiler on/off dependent on state and pump demand
-            controlBurner();        
+        // Check boiler temp is OK and react
+        controlBurner();        
       
-            // Check underfloor heating demand and set pump accordingly
-            controlUFHPump();
+        // Check underfloor heating 
+        controlUFHPump();
       
-            // Check primary heating demand and set pump accordingly
-            controlPriPump();
-        }
+        // Check primary flow
+        controlPriPump();
+    }
               
-        updateStatus();
+    updateStatus();
 
-        displayStatus();
+    displayStatus();
     
-        if (heartBeatSecs % LCD_RESTART_FREQ == 0) {
-            lcd.begin(NUM_COLS, NUM_ROWS);                
-            statusChanged.setAll();                              // Causes a refresh in displayStatus
-        }
+    if (heartBeatSecs % LCD_RESTART_FREQ == 0) {
+        lcd.begin(NUM_COLS, NUM_ROWS);                
+        statusChanged.setAll();                              // Causes a refresh in displayStatus
+    }
     
-        setSystemMode();
+    setSystemMode();
     }
 
     delay(10);
     wakeup.runAnyPending();
 
     if (incomingI2C) processIncomingI2C();            // Set by ISR processOnReceive
-}
-
-void logStartupReason() {
-
-    // Log reason for startup to SYSLOG by testing resetFlag made available on startup - see Megacore refs above
-
-    int myMCUSR;    // Startup reason
-
-    // Order of tests is significant; last succesful test is what's reported
-    if (resetFlag & (1 << WDRF)) myMCUSR = WDRF;				// Watchdog reset
-    if (resetFlag & (1 << EXTRF)) myMCUSR = EXTRF;			// Manual reset
-    if (resetFlag & (1 << PORF)) myMCUSR = PORF;				// Power-on reset
-
-    switch (myMCUSR) {
-    case WDRF:
-        logError(0x01);
-        break;
-    case EXTRF:
-        logError(0x02);
-        break;
-    case PORF:
-        logError(0x03);
-        break;
-    }
 }
 
 void setupComms() {
@@ -440,13 +422,15 @@ void setupSensors() {
     // Initialise wakeup to support background daemons for reading temperature sensors
     wakeup.init();
 
-    // Initialise sensors and start regular background refresh - access latest temperature using getTempC()
-    for (int i = 0; i < NUM_SENSORS; i++) {
-        if (!sensor[i].init(SENSOR_PIN[i], TARGET_PRECISION, CHECK_FREQ[i])) {
-            logError(0xA1);
-        }
-    }
+    // Initialise sensors
+    for (int i = 0; i < NUM_SENSORS; i++) initTempSensor(i, SENSOR_PIN[i]);
     somethingWrong = 0;
+
+    // Schedule temperature readings
+    scheduleTempReadingsFor(UFH_SENSORS, UFH_TEMP_CHECK_FREQ);
+    scheduleTempReadingsFor(BOILER_SENSOR, TEMP_CHECK_FREQ);
+    scheduleTempReadingsFor(PRIMARY_SENSORS, TEMP_CHECK_FREQ);
+
 }
 
 void setupRelays() {
@@ -465,9 +449,14 @@ void setupLCD() {
 
     // Initial display
     updateStatus();
-
     displayStatus();
 }
+/*
+void logError(byte errorCode) {
+    errorLog[numErrors] = errorCode; 
+    if (numErrors++ >= ERR_LIMIT) numErrors--;
+}
+*/
 
 void setSystemMode() {                                // Sets the system mode.  Also set on entry to manual mode
 
@@ -482,8 +471,8 @@ void setSystemMode() {                                // Sets the system mode.  
 				if (!anyZoneDemand) systemMode = DORMANT;  
       break;
 
-	  case ERROR:  
-		    break;
+	case ERROR:  
+		break;
       
     case QUIESING:
       if (anyZoneDemand) systemMode = RUNNING;
@@ -500,6 +489,17 @@ void setSystemMode() {                                // Sets the system mode.  
   }
   
   if (systemMode != prevSystemMode) minsInMode = 0;
+}
+
+
+void scheduleTempReadingsFor(byte liveSensor, byte frequencySecs) {
+
+    for (int i = 0; i < NUM_SENSORS; i++) {
+        if (liveSensor & _BV(i)) {
+            // Schedule temperature readings
+            if (!wakeup.wakeMeAfter(getTempC, frequencySecs * 1000, i, TREAT_AS_NORMAL | REPEAT_COUNT)) logError(0xA1);
+        }
+    }
 }
 
 void controlBurner() {
@@ -531,7 +531,7 @@ void controlBurner() {
 
 void controlPriPump(){
   
-  switch (systemMode) {                                  // systemMode set by demand.  Fault flags may override pump action
+  switch (systemMode) {                                  // systemMode set by demand.  Fault flags may override pump action - ignore for now
     
     case STARTUP:
       turnRelay(PRI_CIRCUIT_PUMP, OFF);
@@ -539,11 +539,11 @@ void controlPriPump(){
       break; 
      
     case RUNNING:
-      // Shutdown pump if error with Primary sensors - not critical, so ignore for now
+      // Shutdown pump if error with Primary sensor
 //      if (fault(PRI_FLOW) || fault(PRI_RETURN)) {
 //          turnRelay(PRI_CIRCUIT_PUMP, OFF);
 //          return;
-//     }
+//      }
 
       // If demand for heat from non-UFH zones then turn on pump 
       if ((anyZoneDemand & (ZONE_DINING | ZONE_STUDY))) turnRelay(PRI_CIRCUIT_PUMP, ON);
@@ -623,27 +623,27 @@ void controlMixer() {                                // Adjusts the mixer valve 
       if (relayOn(UFH_PUMP)) {
           
         // Figure out the target mixer temp  
-        targetMixerTemp = min(UFH_FLOW_MAX_TEMP, (int)sensor[UFH_RETURN].getTempC() + UFH_INCREMENT);
+        targetMixerTemp = min(UFH_FLOW_MAX_TEMP, (int)tempC[UFH_RETURN] + UFH_INCREMENT);
       
         switch (mixerState) {
           case STABLE:
             if (timeSinceLast >= CHILL_TIME) {
               // If above target then reduce
-              if (sensor[UFH_FLOW].getTempC() >= (targetMixerTemp + UPPER_THRESHOLD)) {
+              if (tempC[UFH_FLOW] >= (targetMixerTemp + UPPER_THRESHOLD)) {
                 turnRelay(MIXER_OPEN, OFF);
                 turnRelay(MIXER_CLOSE, ON);
                 mixerState = CLOSING;
                 lastChangeOfState = heartBeatSecs;
-                actuationTime = min(0.4 * (sensor[UFH_FLOW].getTempC() - (float)(targetMixerTemp)) + 1, MAX_ACTUATION_TIME);
+                actuationTime = min(0.4 * (tempC[UFH_FLOW] - (float)(targetMixerTemp)) + 1, MAX_ACTUATION_TIME);
               }
               
               // If below target then increase  
-              if (sensor[UFH_FLOW].getTempC() < (targetMixerTemp - LOWER_THRESHOLD)) {
+              if (tempC[UFH_FLOW] < (targetMixerTemp - LOWER_THRESHOLD)) {
                 turnRelay(MIXER_CLOSE, OFF);
                 turnRelay(MIXER_OPEN, ON);
                 mixerState = OPENING;
                 lastChangeOfState = heartBeatSecs;
-                actuationTime = min(0.4 * ((float)(targetMixerTemp) - sensor[UFH_FLOW].getTempC()) + 1, MAX_ACTUATION_TIME);
+                actuationTime = min(0.4 * ((float)(targetMixerTemp) - tempC[UFH_FLOW]) + 1, MAX_ACTUATION_TIME);
               }        
             }
             break;
@@ -708,6 +708,252 @@ void controlRecirc() {
       }
       else turnRelay(DHW_RECIRC_PUMP, OFF);
   }
+}
+
+// Main One Wire functions - implement bus locking
+// -----------------------------------------------
+
+void initTempSensor(byte sensorNum, byte pin) {
+
+    byte deviceDetails[8];                      // Onewire device buffer - contains family code (ROM_FAMILY), device ID (not used here) & CRC
+    byte configuration;
+
+    // Bail if sensor already in use
+    if (!reserveBus(sensorNum)) return;
+
+    oneWire[sensorNum].init(pin);
+
+    // Reset the bus and get the address of the first (& only) device to determine ROM family
+    deviceDetails[ROM_CRC] = 0;
+    oneWire[sensorNum].reset();
+    oneWire[sensorNum].readROM(deviceDetails);
+  
+    if (oneWire[sensorNum].crc8(deviceDetails, ROM_CRC) != deviceDetails[ROM_CRC]) {
+        flagFault(sensorNum);
+        logError(0xd0);
+    }
+
+    romFamily[sensorNum] = deviceDetails[ROM_FAMILY];	   
+
+    // Set the resolution.  Have to write all three bytes of scratchpad, but as alarm function not used first two can be random
+    switch (romFamily[sensorNum]) {
+    case DS18S20: 	
+        break;						// 9 bit resolution only
+    case DS18B20:
+    case DS1822:
+        switch (TEMPERATURE_PRECISION) {					
+      	case 12:		configuration = TEMP_12_BIT; break;
+      	case 11:		configuration = TEMP_11_BIT; break;
+      	case 10:		configuration = TEMP_10_BIT; break;
+      	case 9:			
+      	default:		configuration = TEMP_9_BIT; break;
+        }
+      
+        oneWire[sensorNum].reset();
+        oneWire[sensorNum].skip();					// Avoids the need to send the address (only on single device buses)
+        oneWire[sensorNum].write(WRITESCRATCH);
+        oneWire[sensorNum].write(configuration);
+        oneWire[sensorNum].write(configuration);
+        oneWire[sensorNum].write(configuration);           // Only meaningful byte
+      
+        // Check precision has taken
+        if (readPrecision(sensorNum) != TEMPERATURE_PRECISION) {
+            flagFault(sensorNum);
+            logError(0xd1);
+        }
+        break;
+    default:
+        romFamily[sensorNum] = 0;              // Indicates fault
+        flagFault(sensorNum);
+        logError(0xd2);
+    }
+
+    releaseBus(sensorNum);
+}
+
+void getTempC(int sensorNum) {                  
+    
+/* 
+Re-entrant routine to get temperature reading - takes around 800ms in elapsed time
+
+Has two states:
+- reset sensor - triggered to a schedule set in scheduleTempReadingsFor() and initiate conversion
+- get temperature - triggered once previous state completes
+
+If error, then reset states and wait for repeat run
+*/
+
+    const static byte RESET_SENSOR = 0;
+    const static byte GET_TEMP = 1;
+    byte scratchpad[9];
+
+    static byte state[NUM_SENSORS] = { RESET_SENSOR };
+  
+    // Select appropriate stage of processing depending on how far through the read process has got
+    switch (state[sensorNum]) {
+
+        case RESET_SENSOR:   {                   // Initial state
+
+            // Holds time to convert
+            unsigned int tConv;
+
+            // Bail if sensor already in use
+            if (!reserveBus(sensorNum)) return;
+
+            // Reset bus
+            oneWire[sensorNum].reset();
+            oneWire[sensorNum].skip();
+
+            // Start conversion			
+            oneWire[sensorNum].write(STARTCONVO);
+
+            // Work out how long the sensor needs to work out temperature
+            switch (romFamily[sensorNum]) {
+                case DS18S20:
+                    tConv = T_CONV_DS18S20;
+                    break;
+                case DS18B20:
+                case DS1822:
+                    switch (TEMPERATURE_PRECISION) {
+                        case 12: tConv = T_CONV_12_BIT; break;
+                        case 11: tConv = T_CONV_11_BIT; break;
+                        case 10: tConv = T_CONV_10_BIT; break;
+                        case 9:
+                        default: tConv = T_CONV_9_BIT; break;
+                    }
+                    break;
+                default:
+                    flagFault(sensorNum);
+                    logError(0xd3);
+                    tempC[sensorNum] = ERR_TEMP;
+            }
+
+            // Next state is to read the result
+            state[sensorNum] = GET_TEMP;
+
+            // Which happens in tConv ms.  If error, then reset state and release bus
+            if (!wakeup.wakeMeAfter(getTempC, tConv, sensorNum, TREAT_AS_NORMAL)) {
+                logError(0xA2);
+                state[sensorNum] = RESET_SENSOR;
+                releaseBus(sensorNum);
+            }
+
+            break;
+        }
+
+        case GET_TEMP:                  // Get result of conversion
+            // Get the data into buffer
+            if (readScratchPad(sensorNum, scratchpad)) {
+                // Load the temperature to single variable and add extra resolution if needed
+                unsigned int reading = (((unsigned int)scratchpad[TEMP_MSB]) << 8) | scratchpad[TEMP_LSB];
+
+                if (romFamily[sensorNum] == DS18S20) {			// Fixed 9 bit resolution expandable using 'extended resolution temperature' algorithm
+                    reading = (reading << 3) & 0xFFF0;				// Shift to same position as DS18B20 and truncate 0.5C bit
+                    reading = reading + 12 - scratchpad[COUNT_REMAIN];		// Simplified version of Dallas algorithm 
+                }
+
+                // Convert reading to signed 1/10ths of centigrade
+                tempC[sensorNum] = (float)(reading >> 2) * 0.25;
+
+                // Constrain range if obviously erroneous and raise fault flag 
+                if (tempC[sensorNum] > MAX_TEMP || tempC[sensorNum] < MIN_TEMP) {
+                    tempC[sensorNum] = ERR_TEMP;
+                    flagFault(sensorNum);
+                    logError(0xd4);
+                }
+            }
+            else {
+                flagFault(sensorNum);
+                logError(0xd5);
+                tempC[sensorNum] = ERR_TEMP;
+            }
+
+            // All done.  Wakeup will automatically repeat the process, so just need to set the state and hand back the bus to others
+            state[sensorNum] = RESET_SENSOR;
+            releaseBus(sensorNum);
+
+            break;
+    }
+}
+
+// I2C bus reservation/release routines
+// ------------------------------------
+
+boolean reserveBus(byte sensorNum) {
+
+    // Test if bus already in use; if so then reserve, if not then bail.  Protect test/set against interrupts
+
+    noInterrupts();
+
+    if (sensorInUse[sensorNum]) {
+        interrupts();
+        return false;
+    }
+    else {
+        sensorInUse[sensorNum] = true;          // This blocks access to the sensor - calling routine must release
+        interrupts();
+        return true;
+    }
+}
+
+void releaseBus(byte sensorNum) {
+    // Restore bus access - atomic action; no need to protect from interrupts
+    sensorInUse[sensorNum] = false;
+}
+
+
+// One Wire helper functions - run with bus locked
+// -----------------------------------------------
+
+byte readPrecision(byte sensorNum) {
+
+    byte response = 0;
+    byte scratchpad[9];
+
+    if (readScratchPad(sensorNum, scratchpad)) {
+        switch (scratchpad[CONFIGURATION]) {
+        case DS18S20:
+            response = 9;
+            break;
+        case DS18B20:
+        case DS1822:
+            switch (TEMPERATURE_PRECISION) {
+            case TEMP_12_BIT:  return 12;
+            case TEMP_11_BIT:  return 11;
+            case TEMP_10_BIT:  return 10;
+            case TEMP_9_BIT:   return 9;
+            default:           
+                flagFault(sensorNum);
+                logError(0xd6);
+            }
+        default:
+            flagFault(sensorNum);
+            logError(0xd7);
+        }
+    }
+    else {
+        flagFault(sensorNum);
+        logError(0xd8);
+    }
+
+    return response;
+}
+
+boolean readScratchPad(byte sensorNum, byte* scratchpad) {
+  // Read the scratchpad
+  oneWire[sensorNum].reset();
+  oneWire[sensorNum].skip();
+  oneWire[sensorNum].write(READSCRATCH);
+  		
+  for (int i = 0; i < 9; i++) scratchpad[i] = oneWire[sensorNum].read();
+
+  // Check CRC
+  if (oneWire[sensorNum].crc8(scratchpad, SCRATCHPAD_CRC) != scratchpad[SCRATCHPAD_CRC]) {
+    flagFault(sensorNum);
+    logError(0xd9);
+    return false;
+  }
+  else return true;
 }
 
 
@@ -832,6 +1078,7 @@ void updateStatus() {
         bufPosn += putRelayStatus(MIXER_OPEN, row, bufPosn);   
         bufPosn += putRelayStatus(MIXER_CLOSE, row, bufPosn); 
 
+        BUF_ADD " W%d", wakeupErrorCount);
         break;
 
       case ROW_3: 
@@ -855,7 +1102,6 @@ void updateStatus() {
   for (int i = 0; i < NUM_ROWS; i++) 
     for (int j = 0; j < NUM_COLS + 1; j++) 
       if (oldStatus[i][j] != statusMap[i][j]) statusChanged.put(i * j, true);    
-
 }
 
 unsigned int putRelayStatus(byte relayNum, byte row, byte bufPosn) {
@@ -864,7 +1110,7 @@ unsigned int putRelayStatus(byte relayNum, byte row, byte bufPosn) {
 
 unsigned int putTemp(byte sensorNum, byte row, byte bufPosn) {
   if (fault(sensorNum)) return snprintf(statusMap[row] + bufPosn, NUM_COLS - bufPosn, "%s", "**");
-  else return snprintf(statusMap[row] + bufPosn, NUM_COLS - bufPosn, "%02d", (int)sensor[sensorNum].getTempC());
+  else return snprintf(statusMap[row] + bufPosn, NUM_COLS - bufPosn, "%02d", (int)tempC[sensorNum]);
 }
 
 
@@ -901,6 +1147,7 @@ void processIncomingI2C() {
         Dzf    - DHW demand for heat - zone z either on (f == '1') or off (f != '1') - action needed
         Mmf    - manual mode - direct control.  On (f == '1') or Off (f != '1') - action needed
         Ssn    - status request.  s: D = DHW demand, R = Relay, S = Status (n = row), T = Temperature, Z = Zone demand - response needed
+        SE     - prompt for error report - "OK" if none
         T      - time - info
         Zzf    - Zone demand for heat - zone z either on (f == '1') or off (f != '1') - action needed
 
@@ -976,6 +1223,7 @@ void processIncomingI2C() {
             char timeBuffer[16];
             timeNow = (unsigned int)command << 8 | subCommand;
             dhmToText(timeNow, timeBuffer);
+            //if (timeBuffer[0] == 'B') logError(0xB2);           // "Bad day" returned periodically; need to track down
             basementI2C(OK, 2);
             break;
         }
@@ -997,12 +1245,13 @@ void processIncomingI2C() {
         default: {
             const unsigned int BUFLEN = 32;
             char localBuf[BUFLEN];
-            snprintf(localBuf, BUFLEN, "Bad boiler request: %c%c%c", mode, command, subCommand);
+            snprintf(localBuf, BUFLEN, "%s%c%c%c", errBadBoilerReq, mode, command, subCommand);
             basementI2C(localBuf, BUFLEN);
         }
     }    
   }
 }
+
 
 void processStatusRequest(char statusSelect, int displaySelect) {
 
@@ -1027,14 +1276,23 @@ void processStatusRequest(char statusSelect, int displaySelect) {
 			break;
 
     case 'E':                   // Report any errors to Basement controller
-        listErrors(buffer, TWI_BUFFER_SIZE);
+        if (numErrors == 0) {
+            BUF_ADD "OK");
+        }
+        else {
+            BUF_ADD "%u:", numErrors);
+            for (int i = 0; (i < numErrors) && (i < ERR_LIMIT); i++) BUF_ADD "%02x", errorLog[i]);
+            numErrors = 0;
+        }
+
+        BUF_ADD "\0");
         break;
   
 		case 'R':                   // Relay/pump status
 			limit = NUM_RELAYS - 1;
 
 			BUF_ADD "{\"DA\":\"%c%c\",", meInit, statusSelect);
-			for (int tag = 0; tag < (NUM_RELAYS); tag++) {
+			for (int tag = 0; tag < NUM_RELAYS; tag++) {
 				BUF_ADD "\"%c\":\"%c\"", relayTag[tag], (relayOn(tag)) ? relayTag[tag] : relayTag[tag] + 32);
 				if (tag == limit) BUF_ADD "}\0"); else BUF_ADD ",");
 			}
@@ -1051,7 +1309,7 @@ void processStatusRequest(char statusSelect, int displaySelect) {
 			BUF_ADD "{\"DA\":\"%c%c\",", meInit, statusSelect);
 			for (int tag = 0; tag < (NUM_SENSORS); tag++) {
 				if (fault(tag)) BUF_ADD "\"%c\":\"**\"", sensorTag[tag]);
-				else BUF_ADD "\"%c\":\"%02d\"", sensorTag[tag], (int)sensor[tag].getTempC());
+				else BUF_ADD "\"%c\":\"%02d\"", sensorTag[tag], (int)tempC[tag]);
 				if (tag == limit) BUF_ADD "}\0"); else BUF_ADD ",");
 			}
 			break;
@@ -1087,10 +1345,11 @@ unsigned int basementI2C(char* sendBuffer, int sendBuflen) {
     Wire.beginTransmission(I2C_ADDR_BASEMENT);
     Wire.write(sendBuffer, sendBuflen);
     response = Wire.endTransmission();
-    if (response != 0) logError(0xB0 | (response & 0x0F));          // 1st nibble == 'B', 2nd nibble == Wire.endTransmission response 
 
     // Swap this controller back to be slave
     Wire.begin(I2C_ADDR_BOILER);
+
+    if (response != 0) logError(0xB1);
 
     return response;
 }

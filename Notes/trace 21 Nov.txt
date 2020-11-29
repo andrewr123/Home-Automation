@@ -1,0 +1,81 @@
+aunching Debugger...
+   - Serial debug will start immediately. WiFi (or gdb) debug will start a few seconds or a short time after the remote device connects to the network.
+   - Switch on 'vmicro>debugger>full speed' to prevent debugger message throttling. (read the docs)
+   - If 'in-break live watch' is disabled, continue an existing paused debug session by sending the character 'c' to the board using the Serial window.
+   - If uploading on WiFi but debug is on Serial then it is possible the cpu will be in debug break when OTA upload is attempting connect. If this is the case then sending char 'c' using the serial/debug terminal will force the mcu to continue (like F5).
+   - WiFi debug? Wifi debug is not fully supported yet. Use the vMicro>Debugger menu to set an alternative debug port such as Serial (default speed is 115k)
+   - To view debug messages without trace messages use the 'message windows' option on the monitor window.
+   - Switch off this message and other Tutorial messages using the 'vMicro>General' menu
+Program Running 'Boiler_control'
+01:09:17.395    Boiler_control.ino, line 421	setupSensors()
+   Init1
+01:09:17.521 [up:04s:222ms perf:0ms]   Boiler_control.ino, line 426	setupSensors()
+   Init2
+01:09:28.906 [up:15s:580ms perf:11352ms]   Boiler_control.ino, line 373	loop(void)	i=0
+   Clear 0
+01:09:28.990 [up:15s:631ms perf:14ms]   Boiler_control.ino, line 376	loop(void)
+   Loop
+01:09:39.897 [up:26s:579ms perf:10942ms]   Boiler_control.ino, line 373	loop(void)	i=0
+   Clear 0
+01:09:39.935 [up:26s:630ms perf:14ms]   Boiler_control.ino, line 376	loop(void)
+   Loop
+01:09:50.854 [up:37s:577ms perf:10941ms]   Boiler_control.ino, line 373	loop(void)	i=0
+   Clear 0
+01:09:50.857 [up:37s:628ms perf:15ms]   Boiler_control.ino, line 373	loop(void)	i=1
+   Clear 1
+01:09:50.966 [up:37s:679ms perf:0ms]   Boiler_control.ino, line 373	loop(void)	i=2
+   Clear 2
+01:09:50.968 [up:37s:730ms perf:0ms]   Boiler_control.ino, line 376	loop(void)
+   Loop
+01:10:01.899 [up:48s:582ms perf:10846ms]   Boiler_control.ino, line 373	loop(void)	i=0
+   Clear 0
+01:10:01.901 [up:48s:633ms perf:15ms]   Boiler_control.ino, line 376	loop(void)
+   Loop
+01:10:12.913 [up:59s:574ms perf:10934ms]   Boiler_control.ino, line 373	loop(void)	i=0
+   Clear 0
+01:10:12.915 [up:59s:625ms perf:14ms]   Boiler_control.ino, line 376	loop(void)
+   Loop
+01:10:23.875 [up:01m:10s perf:10950ms]   Boiler_control.ino, line 373	loop(void)	i=0
+   Clear 0
+01:10:23.877 [up:01m:10s perf:14ms]   Boiler_control.ino, line 373	loop(void)	i=1
+   Clear 1
+01:10:23.984 [up:01m:10s perf:0ms]   Boiler_control.ino, line 373	loop(void)	i=2
+   Clear 2
+01:10:23.986 [up:01m:10s perf:0ms]   Boiler_control.ino, line 376	loop(void)
+   Loop
+01:10:34.877 [up:01m:21s perf:10836ms]   Boiler_control.ino, line 373	loop(void)	i=0
+   Clear 0
+01:10:34.880 [up:01m:21s perf:14ms]   Boiler_control.ino, line 376	loop(void)
+   Loop
+01:10:45.900 [up:01m:32s perf:10949ms]   Boiler_control.ino, line 373	loop(void)	i=0
+   Clear 0
+01:10:45.902 [up:01m:32s perf:14ms]   Boiler_control.ino, line 376	loop(void)
+   Loop
+01:10:56.827 [up:01m:43s perf:10935ms]   Boiler_control.ino, line 373	loop(void)	i=0
+   Clear 0
+01:10:56.936 [up:01m:43s perf:15ms]   Boiler_control.ino, line 373	loop(void)	i=1
+   Clear 1
+01:10:56.939 [up:01m:43s perf:0ms]   Boiler_control.ino, line 373	loop(void)	i=2
+   Clear 2
+01:10:57.047 [up:01m:43s perf:0ms]   Boiler_control.ino, line 376	loop(void)
+   Loop
+01:11:07.829 [up:01m:54s perf:10844ms]   Boiler_control.ino, line 373	loop(void)	i=0
+   Clear 0
+01:11:07.939 [up:01m:54s perf:14ms]   Boiler_control.ino, line 376	loop(void)
+   Loop
+01:11:18.870 [up:02m:05s perf:10940ms]   Boiler_control.ino, line 373	loop(void)	i=0
+   Clear 0
+01:11:18.872 [up:02m:05s perf:14ms]   Boiler_control.ino, line 376	loop(void)
+   Loop
+01:11:29.839 [up:02m:16s perf:10947ms]   Boiler_control.ino, line 373	loop(void)	i=0
+   Clear 0
+01:11:29.964 [up:02m:16s perf:14ms]   Boiler_control.ino, line 373	loop(void)	i=1
+   Clear 1
+01:11:29.966 [up:02m:16s perf:0ms]   Boiler_control.ino, line 373	loop(void)	i=2
+   Clear 2
+01:11:29.971 [up:02m:16s perf:0ms]   Boiler_control.ino, line 376	loop(void)
+   Loop
+01:11:40.826 [up:02m:27s perf:10839ms]   Boiler_control.ino, line 373	loop(void)	i=0
+   Clear 0
+01:11:40.938 [up:02m:27s perf:14ms]   Boiler_control.ino, line 376	loop(void)
+   Loop

@@ -21,6 +21,8 @@ Dec 18 - v6 - temporary Great Hall signal
 						- change default temperatures
 						- rolling average of sensor temps to smooth glitches
 
+Nov 20 - v7 - remove Gt Hall signal (now has own controller)
+
 - Pins 14, 15 & 16 - uses external voltage divider to sense if (KBE) light on/off - sends message to boiler to turn on/off DHW pump
 - Pin 5 - uses output from relay to determine if Dining manifold wants more heat
 - Pins 6, 7 & 8 are Dallas temp sensors (DUK)
@@ -112,8 +114,7 @@ const static byte ZONE_KITCHEN			 = 2;
 const char sensorTag[]              = { 'D', 'U', 'K'};
 const static byte NUM_SENSORS				= 3;
 const static byte DINING_MANIFOLD		= 3;
-const static byte GREAT_HALL_MANIFOLD = 4;
-const static byte NUM_ZONES = NUM_SENSORS + 2;		// To allow for dining manifold 'zone' as surrogate for all others (with directly wired sensors).  Gt Hall added 2018
+const static byte NUM_ZONES = NUM_SENSORS + 1;		// To allow for dining manifold 'zone' as surrogate for all others (with directly wired sensors)
 
 // Time patterns define whether zone is ON or OFF
 
@@ -124,7 +125,7 @@ const byte AFTERNOON = 2;							// Post noon
 const byte TURNOFF = 3;	 							// Turn off
 const char timePatternTag[] = { 'A', 'B', 'N', 'X' };
 
-byte timePattern[NUM_ZONES] = { BACKGROUND, BACKGROUND, BACKGROUND, BACKGROUND, TURNOFF };		// Set the time patterns for each zone - DUKdg
+byte timePattern[NUM_ZONES] = { BACKGROUND, BACKGROUND, BACKGROUND, BACKGROUND };		// Set the time patterns for each zone - DUKdg
 
 const byte MAX_TIME_PERIODS = 5;           // Number of ON periods allowed per day per time pattern
 
@@ -268,6 +269,10 @@ void setup() {
 
 
 void loop() {
+
+
+    // Run any background daemons - needed to support HA_time.cpp
+    wakeup.runAnyPending();
 
   // Increment heartbeat every second 
   if ((millis() - prevTime) >= HEARTBEAT_FREQ_MS) {   
@@ -467,13 +472,6 @@ void checkManifolds() {      // See if manifolds want more heat - tell boiler
   ard.put(basementIP, UdpArdPort, message, 3);
   bufPosn += snprintf(logMsg + bufPosn, UDP_TX_PACKET_MAX_SIZE - bufPosn, (message[2] == '1') ? "K " : "k ");
   
-  /* Gt Hall has its own controller - from Nov 20
-	// Great Hall no sensors, just determine by timePeriod pending its own controller. 
-	message[1] = 'G';
-	message[2] = (onPeriod[GREAT_HALL_MANIFOLD]) ? '1' : '0';
-	ard.put(basementIP, UdpArdPort, message, 3);
-	bufPosn += snprintf(logMsg + bufPosn, UDP_TX_PACKET_MAX_SIZE - bufPosn, (message[2] == '1') ? "G " : "g ");
-  */
 }
 
 void checkDHW() {      // Test if any demand for DHW - if so then send message to turn on recirc      
@@ -667,7 +665,6 @@ void checkForInput() {
 							case 'D':	zone = ZONE_DINING; break;
 							case 'U': zone = ZONE_UPPER_CORR; break;
 							case 'K': zone = ZONE_KITCHEN; break;
-							case 'G': zone = GREAT_HALL_MANIFOLD; break;
 							default: SENDLOGM('W', "Invalid zone");
 					}
 
