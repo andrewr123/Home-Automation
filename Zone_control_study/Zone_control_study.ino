@@ -148,6 +148,9 @@ void setup() {
 
 void loop() {
 
+		const byte BUFLEN = 64;
+		char buffer[BUFLEN];
+
 		// Reset watchdog - if fault then this won't happen and watchdog will fire, restarting the sketch
 		wdt_reset();
 
@@ -168,6 +171,10 @@ void loop() {
 
 				// See if manifold wants more heat - tell boiler
 				if (heartBeatSecs % CHECK_MANIFOLD_FREQ == 0) checkManifold();
+
+				// Report any errors
+				listErrors(buffer, BUFLEN);
+				if (strstr(buffer, "OK") == NULL) SENDLOGM('W', buffer);
 		}
 
 		delay(50);
@@ -324,16 +331,16 @@ void processIncomingUDP() {
 
 				case 'P':        // Set timePattern for zone
 						switch (recvBuffer[1]) {
-						case 'S': zone = ZONE_STUDY; break;
-						default: SENDLOGM('W', "Invalid zone");
+								case 'S': zone = ZONE_STUDY; break;
+								default: SENDLOGM('W', "Invalid zone");
 						}
 
 						switch (recvBuffer[2]) {
-						case 'A': timePattern[zone] = ALLDAY; break;
-						case 'B': timePattern[zone] = BACKGROUND; break;
-						case 'N':	timePattern[zone] = AFTERNOON; break;
-						case 'X':	timePattern[zone] = TURNOFF; break;
-						default: SENDLOGM('W', "Invalid timePattern");
+								case 'A': timePattern[zone] = ALLDAY; break;
+								case 'B': timePattern[zone] = BACKGROUND; break;
+								case 'N':	timePattern[zone] = AFTERNOON; break;
+								case 'X':	timePattern[zone] = TURNOFF; break;
+								default: SENDLOGM('W', "Invalid timePattern");
 						}
 
 						// Reply to requestor
@@ -345,19 +352,32 @@ void processIncomingUDP() {
 
 						break;
 
-				case 'S':        // Status request - just a ping at present to test time pattern
+				case 'S': {     // Status request - at present just timePattern and syslog level
+						switch (recvBuffer[1]) {
+								case 'P': {					// Current time pattern
+										char programme = timePatternTag[timePattern[ZONE_STUDY]];
+										BUF_ADD "{\"DA\":\"%cP\", \"%c\":\"%c\"}\0", meInit, meInit, (onPeriod[ZONE_STUDY]) ? programme : programme + 32);
+										break;
+								}
 
-						BUF_ADD "{\"DA\":\"%c%c\",", meInit, timePatternTag[timePattern[ZONE_STUDY]]);
-						BUF_ADD "}\0");
+								case 'X':				// Syslog notification level
+										BUF_ADD "{\"DA\":\"%cX\", \"X\":\"%c\"}\0", meInit, syslogLevel);
+										break;
 
+								default:
+										BUF_ADD "Invalid status request: %c\0", recvBuffer[1]);
+										SENDLOGM('W', sendBuffer);
+						}
+						
 						// Reply to requestor
 						ard.reply(REPLY_PORT, sendBuffer, bufPosn);
 
-					// Copy to syslog
+						// Copy to syslog
 
-					SENDLOGM('D', sendBuffer);
+						SENDLOGM('D', sendBuffer);
 
-					break;
+						break;
+				}
 
 				case 'X':
 						syslogLevel = recvBuffer[1];

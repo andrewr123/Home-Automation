@@ -39,6 +39,7 @@ All other UDP messages passed to boiler unchanged
 */
 
 
+#include <SD.h>
 #define UDP_TX_PACKET_MAX_SIZE 128			// Per override in OneDrive\Documents\Arduino\Libraries\Ethernet\EthernetUDP.h
 #define TWI_BUFFER_SIZE 128							// Per override in AppData\Local\Arduino15\packages\MegaCore\hardware\avr\2.0.3\libraries\Wire\src\utility\twi.h
 
@@ -69,12 +70,28 @@ All other UDP messages passed to boiler unchanged
 char meName[] = "Basement";
 const static char meInit = 'B';
 
-// ****** Pressure sensor - based on WIKA A-10 sensor 0-2.5 bar reading using 4-20mA signal across 250ohm series resistor (in practice, is 240ohm) *****
+/* ****** Pressure sensor - based on WIKA A-10 sensor 0-2.5 bar reading using 4-20mA signal across 250ohm series resistor *****
+		20mA x 250ohm = 5v drop across resistor
+		 4mA x 250ohm = 1v drop
+
+		12v --->  --|
+								|
+						 sensor
+								|
+								|
+								|----> Analog input via 250ohm resistor (for safety)
+								|
+								\
+								/		250ohm resistor (in practice 225 + 22.5 = 247.5)
+								\
+		0v --->  -- |
+*/
+
 
 const static byte PRESSURE_SENSOR = A0;		// To read 4-20mA signal from pressure sensor using 250ohm shunt (1-5v)
 
-const static unsigned int ZERO_BAR_TICKS = 1023 / 5;	// Analog ports return 1023 for 5v
-const static unsigned int DYNAMIC_RANGE_TICKS = 1023 - ZERO_BAR_TICKS;
+const static unsigned int ZERO_BAR_TICKS = 1023 / 5;										// 4mA = 20% of full scale.  Analog ports return 1023 for 5v
+const static unsigned int DYNAMIC_RANGE_TICKS = 1023 - ZERO_BAR_TICKS;	// Deduct to set zero
 const static unsigned int DYNAMIC_RANGE_CENTIBAR = 250;			// 2.5 bar
 byte centibars = 0;
 
@@ -106,10 +123,10 @@ unsigned long prevTime;
 unsigned int heartBeatSecs									= 0;                
 const unsigned int HEARTBEAT_FREQ_MS				= 200;		// 5 heartbeats per second
 const unsigned int CHECK_INPUT_FREQ					= 2;			// Check for messages to pass on to boiler every 400mS
-const unsigned int GET_STATUS_FREQ					= 50;		// Get status from boiler every 10 secs
+const unsigned int GET_STATUS_FREQ					= 50;			// Get status from boiler every 10 secs
 const unsigned int CHECK_ERRORS_FREQ				= 25;			// See if boiler reporting any error - 5 secs
-const unsigned int CHECK_MANIFOLD_FREQ			= 5;			// Check if basement needs heat and alert boiler
-const unsigned int CHECK_PRESSURE_FREQ			= 50;		// Read pressure sensor every 10 secs
+const unsigned int CHECK_MANIFOLD_FREQ			= 25;			// Check if basement needs heat and alert boiler
+const unsigned int CHECK_PRESSURE_FREQ			= 50;			// Read pressure sensor every 10 secs
 const unsigned int CHECK_TIME_FREQ					= 150;		// Work out current time every 30 secs and act on it
 
 // **** Code to preserve internal registers to determine restart reason ****
@@ -163,34 +180,43 @@ void setup() {
 
 void loop() {
 
-  // Reset watchdog - if fault then this won't happen and watchdog will fire, restarting the sketch
-  wdt_reset();
+		const byte BUFLEN = 64;
+		char buffer[BUFLEN];
 
-	// Run any background daemons - needed to support HA_time.cpp
-	wakeup.runAnyPending();
+		// Reset watchdog - if fault then this won't happen and watchdog will fire, restarting the sketch
+		wdt_reset();
 
-  // Increment heartbeat every 200 mS
-  if ((millis() - prevTime) >= HEARTBEAT_FREQ_MS) {   
+		// Run any background daemons - needed to support HA_time.cpp
+		wakeup.runAnyPending();
 
-    prevTime = millis();                  
-    heartBeatSecs++;                                          
+		// Increment heartbeat every 200 mS
+		if ((millis() - prevTime) >= HEARTBEAT_FREQ_MS) {   
 
-    // See if any commands from console or errors from boiler
-		if (heartBeatSecs % CHECK_INPUT_FREQ == 0) processIncomingUDP();
+				prevTime = millis();                  
+				heartBeatSecs++;                                          
 
-		// Calculate current time and pass it on
-		if (heartBeatSecs % CHECK_TIME_FREQ == 0) checkTime();
+				// See if any commands from console or errors from boiler
+				if (heartBeatSecs % CHECK_INPUT_FREQ == 0) processIncomingUDP();
+
+				// Calculate current time and pass it on
+				if (heartBeatSecs % CHECK_TIME_FREQ == 0) checkTime();
  
-    // Get status from boiler and report to syslog
-		if (heartBeatSecs % GET_STATUS_FREQ == 0) reportStatus();
+				// Get status from boiler and report to syslog
+				if (heartBeatSecs % GET_STATUS_FREQ == 0) reportStatus();
 		
-		// Check for any errors and report to syslog
-		if (heartBeatSecs % CHECK_ERRORS_FREQ == 0) checkErrors();
-    
-    // Read the primary circuit pressure
-    if (heartBeatSecs % CHECK_PRESSURE_FREQ == 0) checkPressure();
+				// Check for any errors and report to syslog
+				if (heartBeatSecs % CHECK_ERRORS_FREQ == 0) checkErrors();
 
-  }
+				// Send dummy signal re Basement to prevent timeout from boiler controller
+				if (heartBeatSecs % CHECK_MANIFOLD_FREQ == 0) checkManifold();
+    
+				// Read the primary circuit pressure
+				if (heartBeatSecs % CHECK_PRESSURE_FREQ == 0) checkPressure();
+
+				// Report any errors from this controller (boiler errors reported by checkErrors())
+				listErrors(buffer, BUFLEN);
+				if (strstr(buffer, "OK") == NULL) SENDLOGM('W', buffer);
+		}
 }
 
 void setupComms() {
@@ -273,16 +299,20 @@ void setupBoilerSupport () {
 		pinMode(PRESSURE_SENSOR, INPUT);
 }
 
-
 void processIncomingUDP() {
 
 		/* ***** process incoming from network *****
 
 		Valid inputs:
 
+		Rn		Reset request.  Valid values for 'n':
+						- 8 = boiler
+						- 9 = this controller
 		Ss    Status request; most answered by boiler controller.  All answers in JSON.  Valid values for 's' request:
 						- B = bar pressure in primary circuit (answered here)
+						- M = current mode & time
 						- R = Relay settings
+						- S = Screen readout
 						- T = Temperature
 						- Z = Zone demand
 		Xn    Set syslog reporting level
@@ -320,38 +350,51 @@ void processIncomingUDP() {
 					return;
 				}
 
-				bufPosn = 0;										// Position to start of buffer for output & overwriting redundant input
+				bufPosn = 0;														// Position to start of buffer for output & overwriting redundant input
 
 				switch (recvBuffer[0]) {
-
-					case 'S':											// External status request.  One answered directly, the rest by boiler controller.  
-						switch (recvBuffer[1]) {				// Specific status requested
-							case 'B':
-								BUF_ADD "{\"DA\":\"%c%c\",\"%c\":\"%d.%d\"}\0", meInit, 'B', 'B', centibars / 100, centibars % 100);
+						case 'R':														// Reset boiler or this controller
+								switch (recvBuffer[1]) {
+										case '8':										// Boiler - response should be "BR", gets trapped and reported as a NACK
+												boilerI2C(recvBuffer, 2, NULL, NULL);	
+												break;
+										case '9':										// This controller
+												while (1);							// Infinite loop - triggers watchdog to reset this controller
+												break;
+								}
 								break;
 
-							default:            // All others handled by boiler controller
-								bufPosn = boilerI2C(recvBuffer, 2, sendBuffer, TWI_BUFFER_SIZE);
+						case 'S': {													// External status request.  Two answered directly, the rest by boiler controller. 
+								switch (recvBuffer[1]) {				
+										case 'B':										// System pressure - bars
+												BUF_ADD "{\"DA\":\"%cB\",\"B\":\"%d.%d\"}\0", meInit, centibars / 100, centibars % 100);
+												break;
+
+										case 'X':										// Syslog notification level
+												BUF_ADD "{\"DA\":\"%cX\", \"X\":\"%c\"}\0", meInit, syslogLevel);
+												break;
+
+										default:										// All others handled by boiler controller
+												bufPosn = boilerI2C(recvBuffer, 2, sendBuffer, TWI_BUFFER_SIZE);
+												break;
+								}
+
+								// Reply to requestor
+								ard.reply(REPLY_PORT, sendBuffer, bufPosn);
 
 								break;
 						}
 
-						// Reply to requestor
-						ard.reply(REPLY_PORT, sendBuffer, bufPosn);
-
+						case 'X':														// Set SYSLOG level
+								if (strchr(ALLOWABLE_SYSLOG_LEVELS, recvBuffer[1])) {
+										syslogLevel = recvBuffer[1];
+										syslog.adjustLevel(syslogLevel);
+								}
+								else SENDLOG('W', "Invalid syslog level: ", recvBuffer[1]);
 						break;
 
-					case 'X':
-							if (strchr(ALLOWABLE_SYSLOG_LEVELS, recvBuffer[1])) {
-									syslogLevel = recvBuffer[1];
-									syslog.adjustLevel(syslogLevel);
-							}
-							else SENDLOG('W', "Invalid syslog level: ", recvBuffer[1]);
-						break;
-
-					default:
-						// Send anything else onto the boiler controller
-						boilerI2C(recvBuffer, 3, NULL, NULL);
+						default:														// Send anything else onto the boiler controller
+								boilerI2C(recvBuffer, 3, NULL, NULL);
 				}
 		}
 
@@ -371,15 +414,15 @@ void checkTime() {		// Get current time and pass it to boiler
 
 	sendBuffer[0] = 'T';
 	sendBuffer[1] = timeNow >> 8;
-	sendBuffer[2] = timeNow & 0x00ff;
+	sendBuffer[2] = timeNow & 0xff;
 
 	// Send time to boiler controller
-	boilerI2C(sendBuffer, 3, recvBuffer, RECV_BUFFER_SIZE);
+	boilerI2C(sendBuffer, 3, NULL, NULL);
 
 	// . . . and to syslog 
 	int bufEnd = snprintf(sendBuffer, SEND_BUFFER_SIZE, "T %04X ", timeNow);
 	dhmToText(timeNow, sendBuffer + bufEnd);
-	SENDLOG('I', sendBuffer, recvBuffer);
+	SENDLOGM('D', sendBuffer);
 
 	RESTORE_CONTEXT
 }
@@ -412,15 +455,30 @@ void checkErrors() {
 
 		char sendBuffer[] = "SE";
 		int response;
-		const byte BUFLEN = 32;
+		const byte BUFLEN = 64;
 		char recvBuffer[BUFLEN];
 		memset(recvBuffer, 0x00, BUFLEN);
 		
 		response = boilerI2C(sendBuffer, 2, recvBuffer, BUFLEN);
 
-		if (!((recvBuffer[0] == 'O') && (recvBuffer[1] == 'K'))) {
-				SENDLOG('W', "Boiler errs: ", recvBuffer);   // Boiler is reporting an error
+		if (strstr(recvBuffer, "OK") == NULL) {									// Boiler is reporting an error
+				if (strstr(recvBuffer, "1:02") != NULL) {
+						SENDLOGM('W', "Boiler restarted");
+				}
+				else {
+						SENDLOG('W', "Boiler errs: ", recvBuffer);
+				}
 		}
+
+		RESTORE_CONTEXT
+}
+
+void checkManifold() {					// Send dummy message to boiler controller to demonstrate still alive
+		SAVE_CONTEXT("cManif")
+
+		char buffer[] = "ZB0";			
+
+		boilerI2C(buffer, 4, NULL, NULL);
 
 		RESTORE_CONTEXT
 }
@@ -448,10 +506,21 @@ void checkPressure() {					// Read primary circuit pressure & display
 	RESTORE_CONTEXT
 }
 
-unsigned int boilerI2C(char* sendBuffer, unsigned int sendBuflen, char* recvBuffer, unsigned int recvBuflen) {     // Handle comms with boiler over I2C
+unsigned int boilerI2C(char* sendBuffer, unsigned int sendBuflen, char* recvBuffer, unsigned int recvBuflen) {     
+		
+		/*
+		Bidirection comms with boiler over I2C
+
+		Send message then check reply, returning size of data received.  
+		
+		Calling routine sets recvBuffer to indicate nature of reply expected:
+		- NULL recvBuffer: ACK ("OK") expected and ignored.  If NACK then reported to SYSLOG as error
+		- valid pointer to recvBuffer: data stream expected and returned to calling routine
+
+		*/ 
 		
 		SAVE_CONTEXT("I2C")
-		SENDLOG('D', "Send: ", sendBuffer)
+		SENDLOG('D', "Tx: ", sendBuffer)
 
 		unsigned int dataAvailable, wireStatus, pollCount;
 		const unsigned int pollLimit = 100;					// 2 seconds
@@ -465,7 +534,7 @@ unsigned int boilerI2C(char* sendBuffer, unsigned int sendBuflen, char* recvBuff
 		Wire.beginTransmission(I2C_ADDR_BOILER);
 		Wire.write(sendBuffer, sendBuflen);
 		wireStatus = Wire.endTransmission();
-		if (wireStatus > 0) SENDLOG('W', "Error sending to boiler: ", wireStatus);
+		if (wireStatus > 0) SENDLOG('W', "Tx NACK: ", wireStatus);
 
 		// Swap this controller to be slave and establish onReceive ISR
 		Wire.begin(I2C_ADDR_BASEMENT);
@@ -475,25 +544,31 @@ unsigned int boilerI2C(char* sendBuffer, unsigned int sendBuflen, char* recvBuff
 		// Loop until data received/timeout
 		pollCount = 0;
 		while (pollCount++ < pollLimit && !incomingI2C) delay(20);
-		if (pollCount > 5) SENDLOG('W', "Poll ms: ", pollCount * 20);
+		if (pollCount > 5) SENDLOG('W', "Rx ms: ", pollCount * 20);
 
 		// Read the data - often not interested, but need a positive acknowledgement from boiler
 		if (dataAvailable = Wire.available()) {
 				if (recvBuffer == NULL) {												// No data expected by calling routine, but we check handshake here
-						if (dataAvailable > BUFLEN) dataAvailable = BUFLEN;
-						for (int i = 0; i < dataAvailable; i++) localBuf[i] = Wire.read();
+						dataAvailable = constrain(dataAvailable, 0, BUFLEN);
 
-						if (!((localBuf[0] == 'O') && (localBuf[1] == 'K'))) SENDLOG('W', "NACK from boiler:", localBuf);
+						for (int i = 0; i < dataAvailable; i++) localBuf[i] = Wire.read();
+						localBuf[dataAvailable] = 0x00;
+
+						if (strstr(localBuf, "OK") == NULL) {
+								SENDLOG('W', "NACK:", localBuf);
+						}
 				}
 				else {											// Substantive response expected - typically Status request or potentially Error report
 						if (dataAvailable > recvBuflen) dataAvailable = recvBuflen;
+
 						for (int i = 0; i < dataAvailable; i++) recvBuffer[i] = Wire.read();
+
 						recvBuffer[dataAvailable] = 0x00;
-						SENDLOG('D', "Recv: ", recvBuffer)
+						SENDLOG('D', "Rx: ", recvBuffer)
 				}
 		}
 		else {
-				snprintf(localBuf, BUFLEN, "No boiler response to %s", sendBuffer);
+				snprintf(localBuf, BUFLEN, "No Rx to %s", sendBuffer);
 				SENDLOGM('W', localBuf);
 		}
 

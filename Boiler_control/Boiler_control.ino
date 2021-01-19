@@ -18,9 +18,10 @@ Jun 20 - v6 - improve error handling on comms loss - re-start comms
 Nov 20 - v7 - adopt interrupt-driven usage of I2C comms, alternating master/slave relationship to provide duplex comms
               (equivalent changes in Basement controller)
             - re-engineer to split request/read steps in sensor processing to reduce delays - uses 'wakeup'
+Jan 21 - v8 - move to Optiboot loader & implement watchdog timer
             - move temperature sensor code to HA_temperature library
 
-To do: provide 5v supply to sensors through dedicated pins, allowing hard reset; implement watchdog - use Optiboot bootloader 
+To do: provide 5v supply to sensors through dedicated pins, allowing hard reset
 
 
 Uses TWI/I2C interface to communicate with the outside world.  Avoids the need for an Ethernet shield on what is a crowded board
@@ -61,11 +62,16 @@ Pin     Symbol	Function
 
 Pin usage (max on Uno = 22)
 
+Uno pinout - see https://www.circuito.io/blog/arduino-uno-pinout/
+https://components101.com/microcontrollers/arduino-uno
+https://www.arduino.cc/en/reference/board
+
+AtMega chip limits: https://electronics.stackexchange.com/questions/67092/how-much-current-can-i-draw-from-the-arduinos-pins
 
 Digital pins
 ------------
 
-  D0 - D1 - reserved for use by USB link and biased with 1k resistors - effectively off limits
+  D0 - D1 - reserved for use by USB/serial - effectively off limits
 
 Temperature sensors
 
@@ -98,7 +104,7 @@ Relay driver using 595 shift register
 Analog pins
 -----------
 
-A0 - on-off signal - 5v == ON, 0v == OFF
+A0 - spare
 A1 - spare
 A2 - spare
 A3 - spare
@@ -107,10 +113,13 @@ A4 & A5 - TWI
 */
 
 #define TWI_BUFFER_SIZE 96		// Per override in AppData\Local\Arduino15\packages\arduino\hardware\avr\1.8.3\libraries\Wire\src\wire.h & \utilities\twi.
-#define NUM_SENSORS 5         // For the moment, align to HA_temperature
+#define BOILER_CONTROLLER
 
 #include <arduino.h>
 #include <avr/wdt.h>
+
+#include "HA_globals.h"
+
 #include <LiquidCrystal.h>
 #include "Wakeup.h"
 #include "TimerOne.h"            // NB: modified version of public TimerOne library
@@ -119,7 +128,7 @@ A4 & A5 - TWI
 #include "Bitstring.h"
 
 #include "HA_temperature.h"
-#include "HA_globals.h"
+
 
 
 // ***** Identity - on JSON strings *****
@@ -133,44 +142,40 @@ volatile int incomingSize;
 #define I2C_ADDR_BOILER 2
 #define I2C_ADDR_BASEMENT 1
 
-// ****** Temperature sensor objects *******
-
-HA_temperature sensor[NUM_SENSORS];
-  
 // *************  Temperature sensors - Dallas DS18B20  ***********
 
-//extern const byte NUM_SENSORS;      // Defined in HA_temperature
+const static byte TEMP_SENSOR_PIN[NUM_TEMP_SENSORS] = { 2, 3, 4, 5, 6 };  // DIO pins - Dallas sensors
+const static byte TEMP_SENSOR_POWER_PIN = A0;												      // DIO pin - 5v power to Dallas temp sensors
 
+HA_temperature tSensor[NUM_TEMP_SENSORS];                       // Sensor objects
+
+const char tSensorTag[] = { 'B', 'U', 'u', 'D', 'T' };
 const static byte PRI_FLOW          = 0;
 const static byte UFH_FLOW          = 1;      
 const static byte UFH_RETURN        = 2;      
 const static byte BOILER            = 3; 				  
 const static byte PRI_RETURN        = 4;
-const char sensorTag[] = { 'B', 'U', 'u', 'D', 'T'};
 
-const static byte TARGET_PRECISION  = 10;                   // Equates to 0.25C - good enough
-
-// Digital sensor pins on Uno
-const static byte SENSOR_PIN[NUM_SENSORS] = { 2, 3, 4, 5, 6 };
+const static byte TARGET_TEMP_PRECISION = 10;                   // Equates to 0.25C - good enough
 
 // ****** Control flags ******
 
 byte somethingWrong                 = 0;            // If BV == 1, then display flag (and shutdown if critical)
-const static byte NUM_FAULT_FLAGS   = NUM_SENSORS;
+const static byte NUM_FAULT_FLAGS   = NUM_TEMP_SENSORS;
 const char faultTag[NUM_FAULT_FLAGS] = { 'P', 'U', 'u', 'B', 'p' };
 
 // *****************  On/off relays  ********************
 
+const static byte NUM_RELAYS = 8; 
 const static byte BURNER             = 0;
 const static byte MIXER_OPEN         = 1;
 const static byte MIXER_CLOSE        = 2;
-const static byte DHW_PRIMARY_PUMP   = 3;           // Not used
+//const static byte DHW_PRIMARY_PUMP   = 3;           // Not used
 const static byte UFH_PUMP           = 4;
 const static byte PRI_CIRCUIT_PUMP   = 5;
 const static byte DHW_RECIRC_PUMP    = 6;
-const static byte INTERNET           = 7;          // Not used
-const char relayTag[] = { 'B', 'O', 'C', 'D', 'U', 'P', 'R', 'I'};
-const static byte NUM_RELAYS         = 8;
+//const static byte INTERNET           = 7;          // Not used
+const char relayTag[NUM_RELAYS]     = { 'B', 'O', 'C', 'D', 'U', 'P', 'R', 'I'};
 byte startupPending = 0;            // Flags cleared as each relay goes through startup
   
 // Relay ports on 595
@@ -199,8 +204,8 @@ const static byte NUM_ZONES          = 5;
 const static byte STABLE                   = 0;
 const static byte OPENING                  = 1;
 const static byte CLOSING                  = 2;
-const char mixerTag[]                      = {'S', 'T', 't', 'F', 'f', 'Z'};
-const static byte NUM_MIXERS               = 6;
+//const char mixerTag[]                      = {'S', 'T', 't', 'F', 'f', 'Z'};
+//const static byte NUM_MIXERS               = 6;
 
 const static int UFH_INCREMENT             = 15;           // Added to current return temperature to give target flow temperature
 const static int UFH_FLOW_MAX_TEMP         = 50;           // Degrees C at which to turn off mixer
@@ -249,7 +254,7 @@ const unsigned int DHW_DEMAND_CHECK_FREQ     = 5;        // Check if DHW demand
 const unsigned int ROUTER_RESTART_CHECK_FREQ = 10;
 const unsigned int ONE_MINUTE                = 60;
 const unsigned int MANUAL_TIMEOUT_MINS       = 10;        // Minutes allowed in MANUAL; then set to RUNNING
-const byte CHECK_FREQ[NUM_SENSORS] = { UFH_TEMP_CHECK_FREQ, TEMP_CHECK_FREQ, TEMP_CHECK_FREQ, TEMP_CHECK_FREQ, UFH_TEMP_CHECK_FREQ };
+const byte CHECK_FREQ[NUM_TEMP_SENSORS] = { UFH_TEMP_CHECK_FREQ };
 
 
 // ****************  LCD display  ***************************
@@ -288,7 +293,10 @@ eSystemMode systemMode;
 const char modeTag[] = { 'S', 'E', 'R', 'Q', 'D', 'M' };
 
 
-// **** Code to preserve internal registers to determine restart reason ****
+// PRE-BOOT CODE
+// -------------
+
+// **** Optiboot code to preserve internal registers to determine restart reason ****
 /*
    Code added from https://github.com/Optiboot/optiboot/blob/master/optiboot/examples/test_reset/test_reset.ino
 
@@ -322,26 +330,28 @@ void setup(void) {
 
     MCUSR = 0;
     wdt_disable();
-    wdt_enable(WDTO_8S);
+
+    // Initialise wakeup to support background daemons or temperature reading
+    wakeup.init();
 
     // Startup actions
-    logStartupReason();
     setupComms();
-    setupSensors();
+    logStartupReason();
     setupRelays();
-
+    setupTempSensors();
     setupLCD();
-
 
     // Go into startup mode
     systemMode = STARTUP;
-    startupPending = _BV(BURNER) | _BV(MIXER_OPEN) | _BV(DHW_PRIMARY_PUMP) | _BV(UFH_PUMP) | _BV(PRI_CIRCUIT_PUMP) | _BV(DHW_RECIRC_PUMP);
-    startupPending &= ~_BV(DHW_PRIMARY_PUMP);          // Clear startup flag - unused
+    startupPending = _BV(BURNER) | _BV(MIXER_OPEN)| _BV(UFH_PUMP) | _BV(PRI_CIRCUIT_PUMP) | _BV(DHW_RECIRC_PUMP);
+    //startupPending &= ~_BV(DHW_PRIMARY_PUMP);          // Clear startup flag - unused
+
+    // Start watchdog with 8 sec timeout
+    wdt_enable(WDTO_8S);
 
     // Start the relative clock
     prevTime = millis();
 }
-
 
 void loop(void) { 
 
@@ -358,31 +368,15 @@ void loop(void) {
 
         if (heartBeatSecs % DHW_DEMAND_CHECK_FREQ == 0) controlRecirc();       // If DHW demand then turn on recirc pump & start countdown timer
     
-        if (heartBeatSecs % UFH_TEMP_CHECK_FREQ == 0) {
-            
-            // Get latest temperatures - constantly refreshed in background
-            sensor[UFH_FLOW].getTempC();  
-            sensor[UFH_RETURN].getTempC();
-
-            // Check status of mixer and adjust to hit target output temperature
-            controlMixer();        
-        }
+        if (heartBeatSecs % UFH_TEMP_CHECK_FREQ == 0) controlMixer();          // Check status of mixer and adjust to hit target output temperature
         
-        if (heartBeatSecs % TEMP_CHECK_FREQ == 0) {                         // Main loop - relatively infrequent as temps don't change too rapidly
+        if (heartBeatSecs % TEMP_CHECK_FREQ == 0) {                         // Main loop - relatively infrequent as temps don't change too rapidly  
+      
+            controlUFHPump();                       // Check underfloor heating demand and set pump accordingly
 
-             // Get latest temperatures - constantly refreshed in background
-            sensor[BOILER].getTempC();
-            sensor[PRI_FLOW].getTempC();
-            sensor[PRI_RETURN].getTempC();
- 
-            // Set boiler on/off dependent on state and pump demand
-            controlBurner();        
-      
-            // Check underfloor heating demand and set pump accordingly
-            controlUFHPump();
-      
-            // Check primary heating demand and set pump accordingly
-            controlPriPump();
+            controlPriPump();                       // Check primary heating demand and set pump accordingly
+
+            controlBurner();                        // Set boiler on/off dependent on state and pump demand
         }
               
         updateStatus();
@@ -403,9 +397,18 @@ void loop(void) {
     if (incomingI2C) processIncomingI2C();            // Set by ISR processOnReceive
 }
 
+void setupComms() {
+
+    // Start up Two Wire Interface, with this as slave device #2 (alternates with master later)
+    Wire.begin(I2C_ADDR_BOILER);
+    incomingI2C = false;                         // True when Basement controller sends data
+    Wire.onReceive(processOnReceive);             // Sets incomingI2C TRUE if data sent by Basement controller
+}
+
 void logStartupReason() {
 
-    // Log reason for startup to SYSLOG by testing resetFlag made available on startup - see Megacore refs above
+    // Log reason for startup by testing resetFlag made available on startup - see Optiboot refs above
+    // Zone controllers can use SYSLOG, but not available for this controller, so use error reporting instead
 
     int myMCUSR;    // Startup reason
 
@@ -427,34 +430,30 @@ void logStartupReason() {
     }
 }
 
-void setupComms() {
-
-    // Start up Two Wire Interface, with this as slave device #2 (alternates with master later)
-    Wire.begin(I2C_ADDR_BOILER);
-    incomingI2C = false;                         // True when Basement controller sends data
-    Wire.onReceive(processOnReceive);             // Sets incomingI2C TRUE if data sent by Basement controller
-}
-
-void setupSensors() {
-
-    // Initialise wakeup to support background daemons for reading temperature sensors
-    wakeup.init();
-
-    // Initialise sensors and start regular background refresh - access latest temperature using getTempC()
-    for (int i = 0; i < NUM_SENSORS; i++) {
-        if (!sensor[i].init(SENSOR_PIN[i], TARGET_PRECISION, CHECK_FREQ[i])) {
-            logError(0xA1);
-        }
-    }
-    somethingWrong = 0;
-}
-
 void setupRelays() {
 
     // Setup relay pins/driver
     pinMode(LATCH_PIN, OUTPUT);
     pinMode(DATA_PIN, OUTPUT);
     pinMode(CLOCK_PIN, OUTPUT);
+}
+
+void setupTempSensors() {
+
+    // Provide power to Dallas sensors
+    pinMode(TEMP_SENSOR_POWER_PIN, OUTPUT);
+    digitalWrite(TEMP_SENSOR_POWER_PIN, LOW);
+    delay(10);
+    digitalWrite(TEMP_SENSOR_POWER_PIN, HIGH);
+    delay(10);
+
+    // Initialise sensors, get initial read and start regular background refresh - access latest temperature using getTempC()
+    for (int i = 0; i < NUM_TEMP_SENSORS; i++) {
+        if (!tSensor[i].init(TEMP_SENSOR_PIN[i], TARGET_TEMP_PRECISION, CHECK_FREQ[i])) {
+            logError(0xB0 | (i & 0x0F));          // 1st nibble == 'B', 2nd nibble == sensor number response
+        }
+    }
+    somethingWrong = 0;
 }
 
 void setupLCD() {
@@ -467,6 +466,15 @@ void setupLCD() {
     updateStatus();
 
     displayStatus();
+}
+
+// ***** TWI ISR *****
+
+void processOnReceive(int length) {
+    // ISR to flag receipt of data from Basement controller - handle established in Setup
+    // Real work then done by processIncomingI2C
+    incomingI2C = true;           // Set flag
+    incomingSize = length;         // Checked against data received
 }
 
 void setSystemMode() {                                // Sets the system mode.  Also set on entry to manual mode
@@ -623,27 +631,27 @@ void controlMixer() {                                // Adjusts the mixer valve 
       if (relayOn(UFH_PUMP)) {
           
         // Figure out the target mixer temp  
-        targetMixerTemp = min(UFH_FLOW_MAX_TEMP, (int)sensor[UFH_RETURN].getTempC() + UFH_INCREMENT);
+        targetMixerTemp = min(UFH_FLOW_MAX_TEMP, (int)tSensor[UFH_RETURN].getTempC() + UFH_INCREMENT);
       
         switch (mixerState) {
           case STABLE:
             if (timeSinceLast >= CHILL_TIME) {
               // If above target then reduce
-              if (sensor[UFH_FLOW].getTempC() >= (targetMixerTemp + UPPER_THRESHOLD)) {
+              if (tSensor[UFH_FLOW].getTempC() >= (targetMixerTemp + UPPER_THRESHOLD)) {
                 turnRelay(MIXER_OPEN, OFF);
                 turnRelay(MIXER_CLOSE, ON);
                 mixerState = CLOSING;
                 lastChangeOfState = heartBeatSecs;
-                actuationTime = min(0.4 * (sensor[UFH_FLOW].getTempC() - (float)(targetMixerTemp)) + 1, MAX_ACTUATION_TIME);
+                actuationTime = min(0.4 * (tSensor[UFH_FLOW].getTempC() - (float)(targetMixerTemp)) + 1, MAX_ACTUATION_TIME);
               }
               
               // If below target then increase  
-              if (sensor[UFH_FLOW].getTempC() < (targetMixerTemp - LOWER_THRESHOLD)) {
+              if (tSensor[UFH_FLOW].getTempC() < (targetMixerTemp - LOWER_THRESHOLD)) {
                 turnRelay(MIXER_CLOSE, OFF);
                 turnRelay(MIXER_OPEN, ON);
                 mixerState = OPENING;
                 lastChangeOfState = heartBeatSecs;
-                actuationTime = min(0.4 * ((float)(targetMixerTemp) - sensor[UFH_FLOW].getTempC()) + 1, MAX_ACTUATION_TIME);
+                actuationTime = min(0.4 * ((float)(targetMixerTemp) - tSensor[UFH_FLOW].getTempC()) + 1, MAX_ACTUATION_TIME);
               }        
             }
             break;
@@ -864,7 +872,7 @@ unsigned int putRelayStatus(byte relayNum, byte row, byte bufPosn) {
 
 unsigned int putTemp(byte sensorNum, byte row, byte bufPosn) {
   if (fault(sensorNum)) return snprintf(statusMap[row] + bufPosn, NUM_COLS - bufPosn, "%s", "**");
-  else return snprintf(statusMap[row] + bufPosn, NUM_COLS - bufPosn, "%02d", (int)sensor[sensorNum].getTempC());
+  else return snprintf(statusMap[row] + bufPosn, NUM_COLS - bufPosn, "%02d", (int)tSensor[sensorNum].getTempC());
 }
 
 
@@ -880,17 +888,6 @@ void displayStatus() {
         lcd.print((statusMap[row][col] >= 20) ? statusMap[row][col] : ' ');        // Make sure only printable chars
       }
 }
-
-
-// ***** TWI ISR *****
-
-void processOnReceive(int length) {
-    // ISR to flag receipt of data from Basement controller - handle established in Setup
-    // Real work then done by processIncomingI2C
-    incomingI2C = true;           // Set flag
-    incomingSize = length;         // Checked against data received
-}
-
 
 void processIncomingI2C() {
 
@@ -947,7 +944,7 @@ void processIncomingI2C() {
                 case 'B':      switchVal = BURNER; break;
                 case 'O':      switchVal = MIXER_OPEN; break;
                 case 'C':      switchVal = MIXER_CLOSE; break;
-                case 'D':      switchVal = DHW_PRIMARY_PUMP; break;
+                //case 'D':      switchVal = DHW_PRIMARY_PUMP; break;
                 case 'U':      switchVal = UFH_PUMP; break;
                 case 'P':      switchVal = PRI_CIRCUIT_PUMP; break;
                 case 'R':      switchVal = DHW_RECIRC_PUMP; break;
@@ -1046,12 +1043,13 @@ void processStatusRequest(char statusSelect, int displaySelect) {
 			break;
 
 		case 'T':                   // Current temperatures
-			limit = NUM_SENSORS - 1;
+			limit = NUM_TEMP_SENSORS - 1;
 
 			BUF_ADD "{\"DA\":\"%c%c\",", meInit, statusSelect);
-			for (int tag = 0; tag < (NUM_SENSORS); tag++) {
-				if (fault(tag)) BUF_ADD "\"%c\":\"**\"", sensorTag[tag]);
-				else BUF_ADD "\"%c\":\"%02d\"", sensorTag[tag], (int)sensor[tag].getTempC());
+			for (int tag = 0; tag < (NUM_TEMP_SENSORS); tag++) {
+        BUF_ADD "\"%c\":\"", tSensorTag[tag]);
+				if (fault(tag)) BUF_ADD "**\"");
+				else BUF_ADD "%02d\"", (int)tSensor[tag].getTempC());
 				if (tag == limit) BUF_ADD "}\0"); else BUF_ADD ",");
 			}
 			break;
