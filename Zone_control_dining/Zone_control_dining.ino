@@ -130,6 +130,7 @@ const static byte TEMP_SENSOR_POWER_PIN = 9;												        // DIO pin - 5v 
 HA_temperature tSensor[NUM_TEMP_SENSORS];														        // Dallas sensor objects
 
 const static char tSensorTag[NUM_TEMP_SENSORS] = { 'D', 'U', 'K', 'O' };
+const static byte OUTSIDE_TEMP_SENSOR = 3;
 
 const static byte TARGET_TEMP_PRECISION = 10;												        // Equates to 0.25C - good enough
 
@@ -172,7 +173,7 @@ const static byte LATCH_PIN = 19;
 
 // ***** External comms *****
 
-char syslogLevel = 'D';
+char syslogLevel = 'N';
 const char ALLOWABLE_SYSLOG_LEVELS[] = "XACEWNID";
 
 // ******  Time and time patterns ******
@@ -208,13 +209,15 @@ byte timePattern[NUM_ZONES] = { ALLDAY, BACKGROUND, ALLDAY, BACKGROUND };		// Se
 
 unsigned long prevTime;
 unsigned int heartBeatSecs = 0;
-const unsigned int HEARTBEAT_FREQ_MS        = 1000;		// 1 heartbeats per second
-const unsigned int CHECK_INPUT_FREQ         = 1;			// Check if any messages from console or other arduinos
+const unsigned int HEARTBEAT_FREQ_MS        = 1000;		          // 1 heartbeats per second
+const unsigned int CHECK_INPUT_FREQ         = 1;			          // Check if any messages from console or other arduinos
 const unsigned int CHECK_TEMP_FREQ          = 10;
-const unsigned int CHECK_TEMP_SENSORS_FREQ  = 60;						// Check temperature sensors every minute - restart if necessary
-const unsigned int CHECK_DHW_FREQ           = 5;        // Check if DHW recirc needed and alert boiler
-const unsigned int CHECK_MANIFOLD_FREQ      = 5;						// Check if manifolds need heat and alert boiler
-const unsigned int CHECK_TIME_FREQ          = 30;							// Work out current time every 30 secs and act on it
+const unsigned int CHECK_TEMP_SENSORS_FREQ  = 60;						    // Check temperature sensors every minute - restart if necessary
+const unsigned int CHECK_DHW_FREQ           = 5;                // Check if DHW recirc needed and alert boiler
+const unsigned int SIGNAL_BOILER_FREQ       = 5;						    // Check if manifolds need heat and alert boiler
+const unsigned int SIGNAL_OUTSIDE_TEMP_FREQ = 60;               // Send outside temp to other controllers
+const unsigned int CHECK_TIME_FREQ          = 30;							  // Work out current time every 30 secs and act on it
+const unsigned int SYSLOG_FREQ              = 3600;			// Hourly log report
 const byte CHECK_FREQ[NUM_TEMP_SENSORS]     = { CHECK_TEMP_FREQ, CHECK_TEMP_FREQ, CHECK_TEMP_FREQ, CHECK_TEMP_FREQ };
 
 
@@ -305,10 +308,16 @@ void loop() {
         if (heartBeatSecs % CHECK_TEMP_SENSORS_FREQ == 0) checkTemperatureSensors();
 
         // See how room temperatures are doing - compare to target temp and set solenoid appropriately
-        if (heartBeatSecs % CHECK_TEMP_SENSORS_FREQ == 0) checkRoomTemps();
+        if (heartBeatSecs % CHECK_TEMP_SENSORS_FREQ == 0) checkZoneTemps();
+
+        // Send outside temp to other controllers
+        if (heartBeatSecs % SIGNAL_OUTSIDE_TEMP_FREQ == 0) signalOutsideTemp();
 
         // See if manifolds want more heat - tell boiler
-        if (heartBeatSecs % CHECK_MANIFOLD_FREQ == 0) checkManifolds();
+        if (heartBeatSecs % SIGNAL_BOILER_FREQ == 0) signalBoiler();
+
+        // Hourly log
+        if (heartBeatSecs % SYSLOG_FREQ == 0) logToSyslog();
 
         // See if any demand for DHW - if so then turn on recirc
         if (heartBeatSecs % CHECK_DHW_FREQ == 0) checkDHW();
@@ -316,6 +325,9 @@ void loop() {
         // Report any errors
         listErrors(buffer, BUFLEN);
         if (strstr(buffer, "OK") == NULL) SENDLOGM('W', buffer);
+
+        // Check there are still free slots in wakeup stack
+        if (!wakeup.freeSlots()) SENDLOGM('W', "Wakeup full");
     }
 
     delay(50);
@@ -503,7 +515,7 @@ void processIncomingUDP() {
                 break;
             }
 
-            case 'P': {     // Set timePattern for zone
+            case 'P': {                                 // Set timePattern for zone
                 byte zone;
 
                 switch (buffer[1]) {
@@ -524,61 +536,9 @@ void processIncomingUDP() {
                 break;
             }
 
-            case 'S': {     // Status request
-                char displayMode = buffer[1];
-
-                switch (displayMode) {
-                    case 'D': {			// DHW recirc demand
-                        byte limit = NUM_DHW - 1;
-
-                        BUF_ADD "{\"DA\":\"%c%c\",", meInit, displayMode);
-                        for (int i = 0; i < NUM_DHW; i++) {
-                            BUF_ADD "\"%c\":\"%c\"", DHW_TAG[i], (anyDHWDemand & _BV(i)) ? DHW_TAG[i] : DHW_TAG[i] + 32);
-                            if (i == limit) BUF_ADD "}\0"); else BUF_ADD ",");
-                        }
-                        break;
-                    }
-
-                    case 'P': {					// Current timePatterns
-                        byte limit = NUM_ZONES - 1;
-
-                        BUF_ADD "{\"DA\":\"%c%c\",", meInit, displayMode);
-                        for (int zone = 0; zone < NUM_ZONES; zone++) {
-                            char programme = timePatternTag[timePattern[zone]];
-                            BUF_ADD "\"%c\":\"%c\"", zoneTag[zone], (forceOn[zone]) ? 'F' : (onPeriod[zone]) ? programme : programme + 32);
-                            if (zone == limit) BUF_ADD "}\0"); else BUF_ADD ",");
-                        }
-                        break;
-                    }
-
-                    case 'T': {		// Sensor temperatures
-                        byte limit = NUM_TEMP_SENSORS - 1;
-
-                        BUF_ADD "{\"DA\":\"%c%c\",", meInit, displayMode);
-                        for (int i = 0; i < (NUM_TEMP_SENSORS); i++) {
-                            if (tSensor[i].getTempC() == ERR_TEMP) BUF_ADD "\"%c\":\"**\"", tSensorTag[i]);
-                            else {
-                                int leftA, rightA;											// To convert temps from float to two-part ints
-                                leftA = (int)tSensor[i].getTempC();								// Take the (truncated) integer portion
-                                rightA = (tSensor[i].getTempC() - (float)leftA) * 100;     // Subtract the integer portion from the total, then decimal shift
-                                BUF_ADD "\"%c\":\"%d.%u\"", tSensorTag[i], leftA, (rightA < 0) ? -rightA : rightA);
-                            }
-                            if (i == limit) BUF_ADD "}\0"); else BUF_ADD ",");
-                        }
-                        break;
-                    }
-
-                    case 'Z': {		// Zone target temperatures.  '+' at end indicates heat demanded, '=' indicates target temp achieved
-                        byte limit = NUM_CONTROLLABLE_ZONES - 1;     
-
-                        BUF_ADD "{\"DA\":\"%c%c\",", meInit, displayMode);
-                        for (int i = 0; i < NUM_CONTROLLABLE_ZONES; i++) {
-                            BUF_ADD "\"%c\":\"%u%c\"", zoneTag[i], (int)targetC[i], (tSensor[i].getTempC() > targetC[i]) ? '=' : '+');  // Fudge as comparing zone to sensor, but OK at the moment
-                            if (i == limit) BUF_ADD "}\0"); else BUF_ADD ",");
-                        }
-                        break;
-                    }
-                }
+            case 'S': {                                 // Status request
+                // Fill buffer
+                processStatusRequest(buffer[1], buffer, &bufPosn);
 
                 // Reply to requestor
                 ard.reply(REPLY_PORT, buffer, bufPosn);
@@ -590,7 +550,7 @@ void processIncomingUDP() {
                 break;
             }
 
-            case 'X':
+            case 'X':                                   // Set Syslog level
                 if (strchr(ALLOWABLE_SYSLOG_LEVELS, buffer[1])) {
                     syslogLevel = buffer[1];
                     syslog.adjustLevel(syslogLevel);
@@ -602,13 +562,90 @@ void processIncomingUDP() {
                 break;
 
             case 'Z': {                                // Set target temp for zone; no point for zone == 'd'
-                byte zoneNum = 0;
-                while ((buffer[1] != zoneTag[zoneNum]) && (zoneNum < NUM_CONTROLLABLE_ZONES)) zoneNum++;      // Find matching sensor tag
-                if (zoneNum < NUM_CONTROLLABLE_ZONES) targetC[zoneNum] = (float)atoi((char*)buffer + 2);          // If found then set target temp
+                for (int i = 0; i < NUM_CONTROLLABLE_ZONES; i++) {
+                    if (buffer[1] == tSensorTag[i]) {
+                        targetC[i] = atof((char*)buffer + 2);          // If found then set target temp
+                        break;
+                    }
+                }
                 break;
             }
         }
     }
+    RESTORE_CONTEXT
+}
+
+void processStatusRequest(char statusSelect, char* buffer, byte* bufPosn) {
+    SAVE_CONTEXT("pStat")
+
+        // Process response to status requests ('Ss')
+
+    #define BUF_ADD *bufPosn += snprintf(buffer + *bufPosn, UDP_TX_PACKET_MAX_SIZE - *bufPosn,
+
+    switch (statusSelect) {
+        case 'D': {			// DHW recirc demand
+            byte limit = NUM_DHW - 1;
+
+            BUF_ADD "{\"DA\":\"%c%c\",", meInit, statusSelect);
+            for (int i = 0; i < NUM_DHW; i++) {
+                BUF_ADD "\"%c\":\"%c\"", DHW_TAG[i], (anyDHWDemand & _BV(i)) ? DHW_TAG[i] : DHW_TAG[i] + 32);
+                if (i == limit) BUF_ADD "}\0"); else BUF_ADD ",");
+            }
+            break;
+        }
+
+        case 'P': {					// Current timePatterns
+            byte limit = NUM_ZONES - 1;
+
+            BUF_ADD "{\"DA\":\"%c%c\",", meInit, statusSelect);
+            for (int zone = 0; zone < NUM_ZONES; zone++) {
+                char programme = timePatternTag[timePattern[zone]];
+                BUF_ADD "\"%c\":\"%c\"", zoneTag[zone], (forceOn[zone]) ? 'F' : (onPeriod[zone]) ? programme : programme + 32);
+                if (zone == limit) BUF_ADD "}\0"); else BUF_ADD ",");
+            }
+            break;
+        }
+
+        case 'T': {		// Room temperatures
+            byte limit = NUM_TEMP_SENSORS - 1;
+
+            BUF_ADD "{\"DA\":\"%c%c\",", meInit, statusSelect);
+            for (int i = 0; i < (NUM_TEMP_SENSORS); i++) {
+                if (tSensor[i].getTempC() == ERR_TEMP) BUF_ADD "\"%c\":\"**\"", tSensorTag[i]);
+                else {
+                    unsigned int leftA, rightA;											            // To convert temps from float to two-part ints
+                    leftA = (unsigned int)tSensor[i].getTempC();								// Take the integer portion
+                    rightA = (tSensor[i].getTempC() - (float)leftA) * 100;      // Subtract the integer portion from the total, then decimal shift
+                    BUF_ADD "\"%c\":\"%u.%u\"", tSensorTag[i], leftA, rightA);
+                }
+                if (i == limit) BUF_ADD "}\0"); else BUF_ADD ",");
+            }
+            break;
+        }
+
+        case 'X':				// Syslog notification level
+            BUF_ADD "{\"DA\":\"%c%c\", \"X\":\"%c\"}\0", meInit, statusSelect, syslogLevel);
+            break;
+
+        case 'Z': {		// Zone target temperatures.  '+' at end indicates heat demanded, '=' indicates target temp achieved
+            byte limit = NUM_CONTROLLABLE_ZONES - 1;
+
+            BUF_ADD "{\"DA\":\"%c%c\",", meInit, statusSelect);
+            for (int i = 0; i < NUM_CONTROLLABLE_ZONES; i++) {
+                unsigned int leftA, rightA;											// To convert temps from float to two-part ints
+                leftA = (unsigned int)targetC[i];								// Take the integer portion
+                rightA = (targetC[i] - (float)leftA) * 100;     // Subtract the integer portion from the total, then decimal shift
+                BUF_ADD "\"%c\":\"%u.%u%c\"", tSensorTag[i], leftA, rightA, (tSensor[i].getTempC() > targetC[i]) ? '=' : '+');  // Fudge as comparing zone to sensor, but OK at the moment
+                if (i == limit) BUF_ADD "}\0"); else BUF_ADD ",");
+            }
+            break;
+        }
+
+        default:
+            BUF_ADD "Invalid status request: %c\0", statusSelect);
+            SENDLOGM('W', buffer);
+    }
+
     RESTORE_CONTEXT
 }
 
@@ -635,30 +672,26 @@ void checkTime() {		// Get current time, test if any zones are on and turn on di
 
 boolean isOn(byte zone) {  // Check if zone is scheduled to be on or not
 
-		boolean newStatus = false;
-		byte programme = timePattern[zone];
+    boolean programmedOn = false;
+    byte programme = timePattern[zone];
 
-		// Loop through on/off periods for zone and programme to find match
-		for (int i = 0; i < numTimePeriods[zone][programme]; i++) {
-				if (newStatus = dhmBetween(timeNow, timePeriodStart[zone][programme][i], timePeriodEnd[zone][programme][i])) break;    // Exit on match
-		}
+    // Loop through on/off periods for zone and programme to find match
+    for (int i = 0; i < numTimePeriods[zone][programme]; i++) {
+        if (programmedOn = dhmBetween(timeNow, timePeriodStart[zone][programme][i], timePeriodEnd[zone][programme][i])) break;    // Exit on match
+    }
 
     // Clear force flag if moving from OFF to ON
-    if (!onPeriod[zone] && newStatus) forceOn[zone] = false;
+    if (!onPeriod[zone] && programmedOn) forceOn[zone] = false;
 
-		return forceOn[zone] || newStatus;
+    return programmedOn;
 }
 
 void checkTemperatureSensors() {            // Check temp sensors, reset if errors
     SAVE_CONTEXT("cSens")
 
-        byte errorCount = 0;
-
-    // Check there are still free slots in wakeup stack
-    if (!wakeup.freeSlots()) SENDLOGM('W', "Wakeup full");
+    byte errorCount = 0;
 
     // See if sensors OK; if not power cycle and restart. 
-    // At present all sensors on same power line.  Intent is to move to dedicated power lines
     for (int i = 0; i < NUM_TEMP_SENSORS && !errorCount; i++) {
         if (tSensor[i].getTempC() == ERR_TEMP) errorCount++;						// Count errors (and exit loop)
     }
@@ -671,14 +704,14 @@ void checkTemperatureSensors() {            // Check temp sensors, reset if erro
     RESTORE_CONTEXT
 }
 
-void checkRoomTemps() {            // Check sensor temps and set soleniod appropriately
+void checkZoneTemps() {            // Check sensor temps and set Dining soleniod or Kitchen manifold appropriately
   SAVE_CONTEXT("cTemp")
 
   for (int i = 0; i < NUM_ZONE_SENSORS; i++) {      // Ignore outside sensor
 
     if (tSensor[i].getTempC() != ERR_TEMP) {
-      // If temp low then turn solenoid on, else off - sensitivity = 0.25, so 0.5 degree hyteresis
-      if (onPeriod[i]) {
+      // If temp low then turn dining solenoid/kitchen manifold on, else off - sensitivity = 0.25, so 0.5 degree hyteresis
+      if (onPeriod[i] || forceOn[i]) {
         if (tSensor[i].getTempC() > targetC[i]) turnRelay(i, OFF);
         if (tSensor[i].getTempC() < targetC[i]) turnRelay(i, ON);
       }
@@ -690,29 +723,52 @@ void checkRoomTemps() {            // Check sensor temps and set soleniod approp
     }
   }
 
-  // Turn on dining manifold if any Dining-powered zones are on and require heat
-  turnRelay(DINING_MANIFOLD, ((onPeriod[ZONE_DINING] && relayOn(ZONE_DINING)) || 
-                              (onPeriod[ZONE_UPPER_CORR] && relayOn(ZONE_UPPER_CORR)) || 
-                               onPeriod[DINING_MANIFOLD]) ? ON : OFF);
+  // Turn on dining manifold per programme, or if any Dining-powered zones are on and require heat
+  turnRelay(DINING_MANIFOLD, (relayOn(ZONE_DINING) || 
+                              relayOn(ZONE_UPPER_CORR) ||
+                              (onPeriod[DINING_MANIFOLD] || forceOn[DINING_MANIFOLD])) ? ON : OFF);
 
   RESTORE_CONTEXT
 } 
 
-void checkManifolds() {      // See if manifolds want more heat - tell boiler
+void signalOutsideTemp() {
+    SAVE_CONTEXT("sigO")
+    
+    const byte BUFLEN = 10;
+    char buffer[BUFLEN];
+    byte bufPosn = 0;
+    #define BUF_ADD bufPosn += snprintf(buffer + bufPosn, BUFLEN - bufPosn, 
+
+    // Convert outside temp to string and load to buffer
+    if (tSensor[OUTSIDE_TEMP_SENSOR].getTempC() == ERR_TEMP) {
+        BUF_ADD "O**");
+    }
+    else {
+        int leftA, rightA;											                                      // To convert temps from float to two-part ints
+        leftA = (int)tSensor[OUTSIDE_TEMP_SENSOR].getTempC();								          // Take the (truncated) integer portion
+        rightA = (tSensor[OUTSIDE_TEMP_SENSOR].getTempC() - (float)leftA) * 100;      // Subtract the integer portion from the total, then decimal shift
+        BUF_ADD "O%d.%u", leftA, (rightA < 0) ? -rightA : rightA);
+    }
+
+    // Send to other controllers
+    ard.put(GtHallIP, UdpArdPort, buffer, BUFLEN);
+
+    SENDLOGM('D', buffer);
+
+    RESTORE_CONTEXT
+}
+
+void signalBoiler() {      // See if manifolds want more heat - tell boiler
   char message[] = "Zzs";
 
   // Dining manifold status based on output signal from manifold, itself a combination of messages from this controller & room thermostats
-  //diningManifold = digitalRead(MANIFOLD_DEMAND);
   message[1] = 'D';
   message[2] = digitalRead(MANIFOLD_DEMAND) ? '1' : '0';      // On or off
   ard.put(basementIP, UdpArdPort, message, 3);
   
   // Kitchen manifold status deduced from temperature
   message[1] = 'K';
-  //kitchenManifold = (relayOn(ZONE_KITCHEN)) ? ON : OFF;
-  //if (tSensor[ZONE_KITCHEN].getTempC() > targetC[ZONE_KITCHEN]) kitchenManifold = OFF;
-  //if (tSensor[ZONE_KITCHEN].getTempC() < targetC[ZONE_KITCHEN]) kitchenManifold = ON;      // If neither, then remains unchanged
-  message[2] = (relayOn(ZONE_KITCHEN) && onPeriod[ZONE_KITCHEN]) ? '1' : '0';
+  message[2] = (relayOn(ZONE_KITCHEN)) ? '1' : '0';
   ard.put(basementIP, UdpArdPort, message, 3);  
 }
 
@@ -782,4 +838,19 @@ void turnRelay(byte relay, byte state) {
 
 boolean relayOn(byte relay) {
     return relayState & _BV(relay);
+}
+
+void logToSyslog() {
+    SAVE_CONTEXT("log")
+
+    byte bufPosn = 0;
+    char buffer[UDP_TX_PACKET_MAX_SIZE];
+
+    // Log temperatures
+    processStatusRequest('T', buffer, &bufPosn);
+
+    // Copy to syslog
+    SENDLOGM('N', buffer);
+
+    RESTORE_CONTEXT
 }

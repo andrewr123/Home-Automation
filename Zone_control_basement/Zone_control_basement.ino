@@ -443,7 +443,7 @@ void reportStatus() {
 
 		recvBuffer[20] = 0x00;				// Force end of data mark
 
-		SENDLOGM('N', recvBuffer);								// Reflection of boiler LCD
+		SENDLOGM('I', recvBuffer);								// Reflection of boiler LCD
   }
 
 	RESTORE_CONTEXT
@@ -509,7 +509,7 @@ void checkPressure() {					// Read primary circuit pressure & display
 unsigned int boilerI2C(char* sendBuffer, unsigned int sendBuflen, char* recvBuffer, unsigned int recvBuflen) {     
 		
 		/*
-		Bidirection comms with boiler over I2C
+		Bidirectional comms with boiler over I2C
 
 		Send message then check reply, returning size of data received.  
 		
@@ -523,7 +523,9 @@ unsigned int boilerI2C(char* sendBuffer, unsigned int sendBuflen, char* recvBuff
 		SENDLOG('D', "Tx: ", sendBuffer)
 
 		unsigned int dataAvailable, wireStatus, pollCount;
-		const unsigned int pollLimit = 100;					// 2 seconds
+		const unsigned int POLLING_DELAY = 20;					// Time to wait for response
+		const unsigned int POLL_LIMIT = 100;					// Max iterations == 2 seconds
+		const unsigned int REPORT_THRESHOLD = 4;
 		const unsigned int BUFLEN = 32;
 		char localBuf[BUFLEN];
 		
@@ -543,8 +545,11 @@ unsigned int boilerI2C(char* sendBuffer, unsigned int sendBuflen, char* recvBuff
 
 		// Loop until data received/timeout
 		pollCount = 0;
-		while (pollCount++ < pollLimit && !incomingI2C) delay(20);
-		if (pollCount > 5) SENDLOG('W', "Rx ms: ", pollCount * 20);
+		while (pollCount++ < POLL_LIMIT && !incomingI2C) delay(POLLING_DELAY);
+		if (pollCount > REPORT_THRESHOLD) {
+				SENDLOG('W', "Rx ms: ", pollCount * 20);
+				SENDLOG('W', "Msg = ", sendBuffer);
+		}
 
 		// Read the data - often not interested, but need a positive acknowledgement from boiler
 		if (dataAvailable = Wire.available()) {

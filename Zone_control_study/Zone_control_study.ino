@@ -81,7 +81,8 @@ const char timePatternTag[] = { 'A', 'B', 'N', 'X' };
 
 // ... and comparison with timeNow sets flag to determine if zone on or off
 
-boolean onPeriod[NUM_ZONES];                            // Set by time vs programme.  If ON then active; if OFF then go to stanbdy
+boolean onPeriod[NUM_ZONES];                            // Set by time vs programme.  If ON then active; if OFF then go to standby
+boolean forceOn[NUM_ZONES];                             // True if OFF period overriden (by message).  Reset with next ON period
 
 // Set default time patterns
 byte timePattern[NUM_ZONES] = { AFTERNOON };		// Set the time patterns for each zone
@@ -170,7 +171,7 @@ void loop() {
 				if (heartBeatSecs % CHECK_TIME_FREQ == 0) checkTime();
 
 				// See if manifold wants more heat - tell boiler
-				if (heartBeatSecs % CHECK_MANIFOLD_FREQ == 0) checkManifold();
+				if (heartBeatSecs % CHECK_MANIFOLD_FREQ == 0) signalBoiler();
 
 				// Report any errors
 				listErrors(buffer, BUFLEN);
@@ -329,59 +330,72 @@ void processIncomingUDP() {
 
 				switch (recvBuffer[0]) {
 
-				case 'P':        // Set timePattern for zone
-						switch (recvBuffer[1]) {
-								case 'S': zone = ZONE_STUDY; break;
-								default: SENDLOGM('W', "Invalid zone");
-						}
+						case 'F': {     // Force heating on/off - auto cancels at start of next programmed ON period
+								byte zone;
 
-						switch (recvBuffer[2]) {
-								case 'A': timePattern[zone] = ALLDAY; break;
-								case 'B': timePattern[zone] = BACKGROUND; break;
-								case 'N':	timePattern[zone] = AFTERNOON; break;
-								case 'X':	timePattern[zone] = TURNOFF; break;
-								default: SENDLOGM('W', "Invalid timePattern");
-						}
-
-						// Reply to requestor
-						ard.reply(REPLY_PORT, sendBuffer, bufPosn);
-
-						// Copy to syslog
-
-						SENDLOGM('D', sendBuffer);
-
-						break;
-
-				case 'S': {     // Status request - at present just timePattern and syslog level
-						switch (recvBuffer[1]) {
-								case 'P': {					// Current time pattern
-										char programme = timePatternTag[timePattern[ZONE_STUDY]];
-										BUF_ADD "{\"DA\":\"%cP\", \"%c\":\"%c\"}\0", meInit, meInit, (onPeriod[ZONE_STUDY]) ? programme : programme + 32);
-										break;
+								switch (recvBuffer[1]) {
+										case 'S':	zone = ZONE_STUDY; break;
+										default: SENDLOGM('W', "Invalid zone");
 								}
 
-								case 'X':				// Syslog notification level
-										BUF_ADD "{\"DA\":\"%cX\", \"X\":\"%c\"}\0", meInit, syslogLevel);
-										break;
+								forceOn[zone] = recvBuffer[2] == '1';               // Gets picked up at next time refresh
 
-								default:
-										BUF_ADD "Invalid status request: %c\0", recvBuffer[1]);
-										SENDLOGM('W', sendBuffer);
+								break;
 						}
+
+						case 'P':        // Set timePattern for zone
+								switch (recvBuffer[1]) {
+										case 'S': zone = ZONE_STUDY; break;
+										default: SENDLOGM('W', "Invalid zone");
+								}
+
+								switch (recvBuffer[2]) {
+										case 'A': timePattern[zone] = ALLDAY; break;
+										case 'B': timePattern[zone] = BACKGROUND; break;
+										case 'N':	timePattern[zone] = AFTERNOON; break;
+										case 'X':	timePattern[zone] = TURNOFF; break;
+										default: SENDLOGM('W', "Invalid timePattern");
+								}
+
+								// Reply to requestor
+								ard.reply(REPLY_PORT, sendBuffer, bufPosn);
+
+								// Copy to syslog
+
+								SENDLOGM('D', sendBuffer);
+
+								break;
+
+						case 'S': {     // Status request - at present just timePattern and syslog level
+								switch (recvBuffer[1]) {
+										case 'P': {					// Current time pattern
+												char programme = timePatternTag[timePattern[ZONE_STUDY]];
+												BUF_ADD "{\"DA\":\"%cP\", \"S\":\"%c\"}\0", meInit, (forceOn[ZONE_STUDY]) ? 'F' : (onPeriod[ZONE_STUDY]) ? programme : programme + 32);
+												break;
+										}
+
+										case 'X':				// Syslog notification level
+												BUF_ADD "{\"DA\":\"%cX\", \"X\":\"%c\"}\0", meInit, syslogLevel);
+												break;
+
+										default:
+												BUF_ADD "Invalid status request: %c\0", recvBuffer[1]);
+												SENDLOGM('W', sendBuffer);
+								}
 						
-						// Reply to requestor
-						ard.reply(REPLY_PORT, sendBuffer, bufPosn);
+								// Reply to requestor
+								ard.reply(REPLY_PORT, sendBuffer, bufPosn);
 
-						// Copy to syslog
+								// Copy to syslog
 
-						SENDLOGM('D', sendBuffer);
+								SENDLOGM('D', sendBuffer);
 
-						break;
-				}
+								break;
+						}
 
-				case 'X':
-						syslogLevel = recvBuffer[1];
-						syslog.adjustLevel(syslogLevel);
+						case 'X':
+								syslogLevel = recvBuffer[1];
+								syslog.adjustLevel(syslogLevel);
 						break;
 				}
 		}
@@ -415,22 +429,25 @@ void checkTime() {		// Get current time, test if any zones are on and turn on zo
 
 boolean isOn(byte zone) {  // Check if zone is scheduled to be on or not
 
-		boolean newStatus = false;
+		boolean programmedOn = false;
 		byte programme = timePattern[zone];
 
 		// Loop through on/off periods for zone and programme to find match
 		for (int i = 0; i < numTimePeriods[zone][programme]; i++) {
-				if (newStatus = dhmBetween(timeNow, timePeriodStart[zone][programme][i], timePeriodEnd[zone][programme][i])) break;    // Exit on match
+				if (programmedOn = dhmBetween(timeNow, timePeriodStart[zone][programme][i], timePeriodEnd[zone][programme][i])) break;    // Exit on match
 		}
 
-		return newStatus;
+		// Clear force flag if moving from OFF to ON
+		if (!onPeriod[zone] && programmedOn) forceOn[zone] = false;
+
+		return programmedOn;
 }
 
 
-void checkManifold() {
+void signalBoiler() {
 		// Study manifold status based on output signal from manifold and time pattern
 		char message[] = "ZS ";
-		message[2] = (digitalRead(STUDY_MANIFOLD_DEMAND) && onPeriod[ZONE_STUDY]) ? '1' : '0';      // On or off
+		message[2] = (digitalRead(STUDY_MANIFOLD_DEMAND) && (onPeriod[ZONE_STUDY] || forceOn[ZONE_STUDY])) ? '1' : '0';      // On or off
 
 		// Send the message
 		ard.put(basementIP, UdpArdPort, message, 3);

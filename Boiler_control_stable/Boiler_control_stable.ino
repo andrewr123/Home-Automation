@@ -131,8 +131,8 @@ const static char meInit = 'B';
 
 //  ****** Wire/TWI bus for comms with Basement controller ******
 
-volatile boolean incomingI2C;
-volatile int incomingSize;
+volatile boolean g_incomingI2C;
+//volatile int incomingSize;
 #define I2C_ADDR_BOILER 2
 #define I2C_ADDR_BASEMENT 1
   
@@ -283,6 +283,8 @@ const static int T_CONV_DS18S20  = 750;
 // ******   Timing   *******
 //
 unsigned long prevTime;
+unsigned volatile long g_triggerTime;                   // When interrupt received
+unsigned long g_startTime;                              // When interrupt servicing starts
 unsigned int heartBeatSecs                   = 0;          
 unsigned int minsInMode                      = 0;
 unsigned int minsSinceComms = 0;
@@ -331,6 +333,10 @@ enum eSystemMode {
 
 eSystemMode systemMode;
 const char modeTag[] = { 'S', 'E', 'R', 'Q', 'D', 'M' };
+
+// ****** Debugging
+
+byte g_Mode;
 
 
 
@@ -440,17 +446,16 @@ void loop(void) {
         setSystemMode();
     }
 
-    delay(10);
     wakeup.runAnyPending();
 
-    if (incomingI2C) processIncomingI2C();                  // Set by ISR processOnReceive
+    if (g_incomingI2C) processIncomingI2C();                  // Set by ISR processOnReceive
 }
 
 void setupComms() {
 
     // Start up Two Wire Interface, with this as slave device #2 (alternates with master later)
     Wire.begin(I2C_ADDR_BOILER);
-    incomingI2C = false;                         // True when Basement controller sends data
+    g_incomingI2C = false;                         // True when Basement controller sends data
     Wire.onReceive(processOnReceive);             // Sets incomingI2C TRUE if data sent by Basement controller
 }
 
@@ -1228,8 +1233,9 @@ void displayStatus() {
 void processOnReceive(int length) {
     // ISR to flag receipt of data from Basement controller - handle established in Setup
     // Real work then done by processIncomingI2C
-    incomingI2C = true;           // Set flag
-    incomingSize = length;         // Checked against data received
+    g_incomingI2C = true;            // Set flag
+    //g_IncomingSize = length;         // Checked against data received
+    g_triggerTime = millis();          // Start timer
 }
 
 
@@ -1250,16 +1256,19 @@ void processIncomingI2C() {
     All messages trigger a response to Basement controller, either "OK" or real data
 */
 
-  incomingI2C = false;           // Reset flag
-  int _incomingSize;
+  g_incomingI2C = false;           // Reset flag
+  int incomingSize;
 
-	if (_incomingSize = Wire.available()) {
+	if (incomingSize = Wire.available()) {
     
     byte mode = Wire.read(); 
     byte command = Wire.read();
     byte subCommand = Wire.read();      // Redundant for mode 'B' and mode 'S', other than command 'S'
     byte switchVal = 0;
     const char OK[] = "OK";
+
+    g_Mode = mode;
+    g_startTime = millis();
     
     switch (mode) {
 		    case 'B':
@@ -1292,19 +1301,9 @@ void processIncomingI2C() {
             break; 
 
         case 'T': {                               // Time in dhm format
-            timeNow = (unsigned int)(command) << 8 | subCommand;
-/*
-            // Need to track down invalid format received every 2 hrs ("Bad day")
-            char timeBuffer[16];
-            dhmToText(timeNow, timeBuffer);
-            //if (timeBuffer[0] == 'B') {           
-                snprintf(timeBuffer, 16, "Rx %04X", timeNow);
-                basementI2C(timeBuffer, 16);
-           // }
-           // else */ 
-            
-           basementI2C(OK, 2);
-           break;
+            timeNow = (unsigned int)(command) << 8 | subCommand;            
+            basementI2C(OK, 2);
+            break;
         }
         
         case 'Z':              // Zone heat demand - yes/no
@@ -1358,18 +1357,6 @@ void processStatusRequest(char statusSelect, int displaySelect) {
 
     case 'E':                   // Report any errors to Basement controller
         bufPosn = listErrors(buffer, TWI_BUFFER_SIZE);
-        /*
-        if (numErrors == 0) {
-            BUF_ADD "OK");
-        }
-        else {
-            BUF_ADD "%u:", numErrors);
-            for (int i = 0; (i < numErrors) && (i < ERR_LIMIT); i++) BUF_ADD "%02x ", errorLog[i]);
-            numErrors = 0;
-        }
-
-        BUF_ADD "\0");
-        */
         break;
 
     case 'M': {                  // Current mode, time, & time in mode
@@ -1399,14 +1386,9 @@ void processStatusRequest(char statusSelect, int displaySelect) {
 			break;
 
 		case 'S':                   // Status display, line 'displaySelect'
-      /*  if (displaySelect >= NUM_ROWS) {
-            BUF_ADD "{\"DA\":\"%cE\",\"SS%x\":\"Bad request\"}\0", meInit, displaySelect);
-        }
-        else { */
-            for (int i = 0; i < NUM_COLS; i++) buffer[i] = statusMap[displaySelect][i];
-            bufPosn = NUM_COLS + 1;
-      //  }
-			break;
+        for (int i = 0; i < NUM_COLS; i++) buffer[i] = statusMap[displaySelect][i];
+        bufPosn = NUM_COLS + 1;
+			  break;
 
 		case 'T':                   // Current temperatures
 			limit = NUM_TEMP_SENSORS - 1;
@@ -1440,6 +1422,7 @@ void processStatusRequest(char statusSelect, int displaySelect) {
 unsigned int basementI2C(char* sendBuffer, int sendBuflen) {     
     
     unsigned int response;
+    const unsigned long RESPONSE_TIME_THRESHOLD = 50;
 
     // Handle comms with basement over I2C
 
@@ -1455,6 +1438,14 @@ unsigned int basementI2C(char* sendBuffer, int sendBuflen) {
     Wire.begin(I2C_ADDR_BOILER);
 
     if (response != 0) logError(0xB1);
+
+    // Debug - find out if any lengthy commands
+    if (millis() - g_triggerTime > RESPONSE_TIME_THRESHOLD) {
+        logError(0x50);
+        logError(g_Mode);
+        logError((byte)(g_triggerTime - g_startTime));
+        logError((byte)(g_startTime - millis()));
+    }
 
     return response;
 }
